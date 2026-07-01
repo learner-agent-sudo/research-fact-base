@@ -4,10 +4,12 @@
 > Branch: `claude/legal-research-website-jyihm4`
 
 A Claude‑style chat application for legal research. A user asks a legal
-question; the system answers **only** from a designated document corpus, then
-independently **verifies** the answer against authoritative case‑law APIs
-(CanLII for Canada, CourtListener for the US) and a **live web search**. Users
-can also upload a file directly into a conversation.
+question; the system drafts an answer **only** from grounded sources (a
+designated Google Drive corpus + live web search, always with links), then a
+stronger "checker" model **consolidates and verifies** that answer, and case
+citations are independently confirmed against **CanLII** (Canada) and
+**CourtListener** (US). Users can also upload a file directly into a
+conversation.
 
 ---
 
@@ -16,58 +18,73 @@ can also upload a file directly into a conversation.
 | Area | Decision |
 |------|----------|
 | **Corpus source** | Documents live in a **Google Drive** folder the user manages; the app ingests from Drive into a vector index. |
-| **Verification** | **Dual‑jurisdiction.** US citations → **CourtListener** (free API, already available here). Canadian citations → **CanLII API** (user has a key). |
-| **Live search** | Web search (`WebSearch` / `WebFetch`) as the third grounding layer. |
-| **Stack** | **Next.js** (App Router) + **Supabase** (Postgres/pgvector/Storage/Auth) + **Vercel** (hosting) + **Claude** (Anthropic API). |
-| **This session** | Plan only — this document. Build begins after review. |
+| **Answer grounding** | Answers come **only** from the Drive corpus and/or **live web search**, always **with links**. Enforced app-side (see §7). |
+| **Model roles** | **Generator/verifier split.** Free models *draft*; a stronger model *checks*. |
+| **Model gateway** | **OpenRouter** as a single gateway to all models (Grok, Gemini, Llama, Claude, …). |
+| **Generation mode** | **Ensemble** — fan out to several free models in parallel, then consolidate. |
+| **Checker model** | **Gemini by default**; Claude as checker only on the paid tier. |
+| **Keys / cost** | **Owner-supplied keys** + a **tier toggle** (free vs. Claude paid). No per-user keys for now. |
+| **Citation verify** | **CourtListener** (US, free) + **CanLII** (Canada, user key), routed by jurisdiction. |
+| **Stack** | **Next.js** + **Supabase** (Postgres/pgvector/Storage/Auth) + **Vercel** + models via **OpenRouter**. |
+| **This session** | Plan only. Build begins after review. |
 
 ---
 
 ## 2. Core answer pipeline
 
-Every question flows through five stages. Each stage attaches evidence, and the
-final answer is only as strong as what the stages could ground.
+Two kinds of verification run together: the **checker model** verifies
+*content* ("does the answer actually follow from its linked sources?"), and
+**CanLII/CourtListener** verify *citations* ("is this case real and correctly
+named?").
 
 ```
 User question  (+ optional in-chat file upload)
       │
  ┌────▼─────────────────────────────────────────────────────────┐
- │ 1. RETRIEVE   pgvector similarity search over the designated  │
- │               corpus  ──►  top-k relevant chunks              │
+ │ 1. GATHER SOURCES  Build a grounding set, each item tagged     │
+ │    [S1],[S2]… with a link:                                     │
+ │      a) Drive RAG — pgvector top-k chunks (+ Drive doc links)  │
+ │      b) Live web search — results + fetched snippets (+ URLs)  │
  └────┬─────────────────────────────────────────────────────────┘
       │
  ┌────▼─────────────────────────────────────────────────────────┐
- │ 2. DRAFT      Claude answers using ONLY the retrieved chunks,  │
- │               via the Anthropic **Citations API** ──► answer   │
- │               with exact source spans back to each document.   │
+ │ 2. GENERATE (drafters)   Route by tier:                        │
+ │      • Free tier (default): fan out the SAME question+sources  │
+ │        to N free models via OpenRouter (e.g. Grok, Gemini-free,│
+ │        Llama). Each answers ONLY from [S#] sources and cites   │
+ │        every claim by tag.                                     │
+ │      • Paid tier (user toggle): Claude drafts from the sources.│
  └────┬─────────────────────────────────────────────────────────┘
       │
  ┌────▼─────────────────────────────────────────────────────────┐
- │ 3. VERIFY CITATIONS   Extract every case citation from the     │
- │               draft. Route by jurisdiction:                    │
- │                 • US  →  CourtListener  (verify + enrich)      │
- │                 • CA  →  CanLII API     (metadata + citator)   │
- │               Flag: ✅ real · ⚠️ not found · ✏️ corrected       │
+ │ 3. CHECK & CONSOLIDATE   Checker = Gemini (default) / Claude   │
+ │    (paid). It receives the question, the [S#] source set, and  │
+ │    all candidate drafts, then:                                 │
+ │      • merges them into ONE answer,                            │
+ │      • confirms each claim is supported by its cited source —  │
+ │        drops or flags unsupported claims,                      │
+ │      • enforces "every claim carries a valid [S#] link".       │
+ │    (Optional escalation if confidence is low — see §6.)        │
  └────┬─────────────────────────────────────────────────────────┘
       │
  ┌────▼─────────────────────────────────────────────────────────┐
- │ 4. VERIFY LAW   Live web search of the answer's key            │
- │               propositions (e.g. site:canlii.org,             │
- │               site:courtlistener.com, official statutes) to    │
- │               confirm they are current and not overruled.      │
+ │ 4. VERIFY CITATIONS   Deterministic APIs, routed by cite:      │
+ │      • US  →  CourtListener  (verify + hallucination warning)  │
+ │      • CA  →  CanLII         (metadata + citator)              │
  └────┬─────────────────────────────────────────────────────────┘
       │
  ┌────▼─────────────────────────────────────────────────────────┐
- │ 5. COMPOSE   Final answer + a per-claim evidence panel:        │
- │               [📄 in your docs] [⚖️ citation-verified]         │
- │               [🌐 web-confirmed]  with source links.           │
+ │ 5. COMPOSE   Final answer + evidence panel (📄 your docs /     │
+ │    🌐 web / ⚖️ citation-verified) + confidence + a footer      │
+ │    noting which models generated and which checked.           │
  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Why this order.** Retrieval-first keeps the model grounded in *your*
-documents (reduces hallucination). Citation verification is a cheap, high-value
-guardrail — it catches the single most damaging failure in legal AI: a
-fabricated or misquoted case. Web verification is the freshness check.
+**Why this shape.** Free models are cheap and fast but uneven; a strong,
+distinct checker turns an *ensemble of drafts* into one **grounded** answer and
+is the natural place to enforce the "every claim has a link" invariant. This
+generator→verifier / mixture‑of‑agents pattern is well established and keeps
+cost on the free tier for drafting while spending only on one checker pass.
 
 ---
 
@@ -75,68 +92,55 @@ fabricated or misquoted case. Web verification is the freshness check.
 
 | Layer | Choice | Why |
 |-------|--------|-----|
-| Frontend / chat | **Next.js (App Router)** + **Vercel AI SDK** | Streaming chat UI, server actions, file upload. First-class on Vercel. |
-| Hosting | **Vercel** | One-command deploy; a Vercel MCP is available in this environment. |
-| Database + vectors | **Supabase Postgres** + **pgvector** | One store for app data *and* embeddings; `<=>` cosine search. Supabase MCP available for provisioning. |
-| File storage | **Supabase Storage** | Holds in-chat uploads and cached copies of Drive files. |
-| Auth | **Supabase Auth** (Google OAuth) | Same Google identity the user already uses for Drive. |
-| LLM | **Claude** (Anthropic API) | Synthesis, citation extraction, jurisdiction routing. |
-| Embeddings | **Voyage AI** (`voyage-3` family) | Anthropic's recommended embeddings; strong retrieval quality. |
-| Doc parsing | Claude **native PDF** + `mammoth` (DOCX) + Markdown parser | Claude reads PDFs directly; lighter parsers for the rest. |
+| Frontend / chat | **Next.js (App Router)** + **Vercel AI SDK** | Streaming chat UI, server actions, file upload. |
+| Hosting | **Vercel** | One-command deploy; Vercel MCP available here. |
+| Database + vectors | **Supabase Postgres** + **pgvector** | One store for app data *and* embeddings (`<=>` cosine). Supabase MCP available. |
+| File storage | **Supabase Storage** | In-chat uploads + cached Drive files. |
+| Auth | **Supabase Auth** (Google OAuth) | Same Google identity used for Drive. |
+| **Model gateway** | **OpenRouter** | One API key → Grok, Gemini, Llama, Claude, etc. Swap/add models by config, not code. |
+| Generators (free tier) | Ensemble of free models via OpenRouter | Cheap drafting; resilience via diversity. |
+| Checker | **Gemini** (default) / **Claude** (paid) via OpenRouter | Strong, distinct adjudicator. |
+| Embeddings | **Voyage AI** (`voyage-3` family) | High-quality retrieval; independent of the chat gateway. |
+| Doc parsing | `pdf` text extraction + OCR fallback, `mammoth` (DOCX), Markdown | Model-agnostic ingestion (no reliance on a single vendor's native PDF). |
 
-**Claude features we lean on:**
-- **Citations API** — returns exact source spans, so stage 2 produces
-  document-grounded citations automatically (not just a free-text answer).
-- **Native PDF input** — simplifies ingestion of scanned/complex PDFs.
-- Model split: **Claude Opus 4.8** for final synthesis; **Claude Sonnet 5**
-  for cheaper steps (jurisdiction routing, citation extraction, query
-  rewriting). Exact API model IDs to be pulled from Anthropic's current model
-  docs at implementation time.
+**On grounding & citations.** Because generators can be any model, grounding is
+**application-level**, not vendor-specific: sources are tagged `[S1..Sn]` with
+links, models cite by tag, and the checker validates each tag→claim mapping.
+Anthropic's native **Citations API** is kept as an *optional* enhancement only
+when the paid tier runs Claude natively — never a hard dependency.
 
 ---
 
-## 4. Data model (Supabase)
+## 4. Model orchestration layer
+
+A single `ModelRouter` module, driven by config (env), so models are swappable
+without code changes.
 
 ```
-documents            one row per source file (Drive or upload)
-  id                 uuid pk
-  source             'gdrive' | 'upload'
-  drive_file_id      text null          -- Google Drive fileId
-  title              text
-  mime_type          text
-  drive_modified_at  timestamptz null   -- for change detection / re-sync
-  storage_path       text null          -- cached copy in Supabase Storage
-  status             'pending'|'ingesting'|'ready'|'error'
-  created_at         timestamptz
+config (env-driven):
+  TIERS:
+    free:  generators = [grok, gemini-free, llama-*]   # OpenRouter slugs
+           checker    = gemini
+    paid:  generators = [claude-opus]                  # or claude + ensemble
+           checker    = claude   (fallback gemini)
+  FANOUT:   N parallel drafts on free tier
+  ESCALATE: if checker.confidence < threshold OR unsupported_claims > X
+              → retry with stronger generator / paid model
 
-chunks               retrievable units
-  id                 uuid pk
-  document_id        uuid fk -> documents
-  chunk_index        int
-  content            text
-  token_count        int
-  embedding          vector(1024)       -- Voyage embedding
-  metadata           jsonb              -- page, heading, char offsets
-  -- ivfflat / hnsw index on embedding for cosine search
-
-conversations
-  id, user_id, title, created_at
-
-messages
-  id, conversation_id, role, content,
-  citations          jsonb              -- doc spans from Citations API
-  verifications      jsonb              -- CanLII/CourtListener/web results
-  created_at
-
-verification_cache   avoid re-hitting APIs for the same citation
-  citation_key       text pk            -- normalized citation string
-  provider           'canlii'|'courtlistener'
-  result             jsonb
-  fetched_at         timestamptz
+roles:
+  generator(question, sources[])      -> draft citing [S#]
+  checker(question, sources[], drafts[]) -> {answer, kept/dropped claims,
+                                             per-claim source, confidence}
 ```
 
-Row-Level Security on `conversations`/`messages` (per user). The corpus
-(`documents`/`chunks`) is shared/curated and read-only to users.
+- **Tier toggle** in the UI picks `free` vs `paid`. Owner keys back both; the
+  toggle just changes which models the router uses.
+- **Ensemble**: generators run **in parallel** (Promise.all) to hide latency;
+  the checker sees all drafts at once.
+- **Escalation** (optional): a low-confidence or heavily-unsupported result can
+  re-run on a stronger generator before composing.
+- **Cost control**: per-user/day quotas + the ensemble living on free models
+  keep steady-state cost to essentially one checker pass per question.
 
 ---
 
@@ -144,178 +148,211 @@ Row-Level Security on `conversations`/`messages` (per user). The corpus
 
 The corpus is a **designated Drive folder**. Two access roles:
 
-- **Development (me, now):** the `Google_Drive` MCP lets me inspect and test
-  against your Drive during the build.
-- **Production (the app):** a **Google service account** (or the app's OAuth
-  client) with read access to the shared corpus folder. The app never depends
-  on the dev MCP.
+- **Development (me, now):** the `Google_Drive` MCP lets me inspect/test during
+  the build.
+- **Production (the app):** a **Google service account** (read-only) on the
+  shared corpus folder. The app never depends on the dev MCP.
 
-**Ingestion job** (Supabase Edge Function or Next.js route, triggerable
-manually and on a schedule):
+**Ingestion job** (Supabase Edge Function / Next.js route; manual + scheduled):
 
 ```
-1. List folder → files + modifiedTime         (Drive API: files.list)
-2. Diff against `documents.drive_modified_at`  → new / changed files
-3. Download changed files                      (files.get / export)
-     • Google Docs  → export as text/markdown
-     • PDF          → bytes (Claude native read or text extraction)
-     • DOCX         → mammoth → text
-     • MD / TXT     → as-is
-4. Chunk (heading-aware, ~500–800 tokens, overlap) and record page/offset
+1. List folder → files + modifiedTime            (Drive API: files.list)
+2. Diff vs documents.drive_modified_at            → new / changed files
+3. Download changed files                         (files.get / export)
+     • Google Docs → export text/markdown
+     • PDF         → extract text (OCR fallback for scans)
+     • DOCX        → mammoth → text
+     • MD / TXT    → as-is
+4. Chunk (heading-aware, ~500–800 tokens, overlap); record page/offset
 5. Embed each chunk with Voyage
-6. Upsert into documents + chunks; mark status 'ready'
-7. Delete chunks for files removed from the folder
+6. Upsert documents + chunks; mark status 'ready'
+7. Remove chunks for files deleted from the folder
 ```
 
-**Sync strategy:** a "Sync now" button for the admin plus a scheduled job
-(Vercel Cron or Supabase scheduled function) using `modifiedTime` for
-incremental updates so re-ingestion is cheap.
+**Sync:** admin "Sync now" button + scheduled job (Vercel Cron / Supabase),
+incremental via `modifiedTime`.
 
 ---
 
-## 6. Retrieval + grounded answering (stages 1–2)
+## 6. Retrieval + generation + checking (stages 1–3)
 
-1. **Query rewrite** (Sonnet): expand the user's question into a retrieval
-   query; detect likely jurisdiction (US / CA / unclear).
-2. **Vector search**: embed the query (Voyage), `ORDER BY embedding <=> q`,
-   take top-k (start k≈8) with a similarity floor. Optional hybrid search
-   (pgvector + Postgres full-text) for exact term/citation matches.
-3. **Answer with Citations API**: pass the retrieved chunks as documents;
-   instruct Claude to answer **only** from them and abstain when the corpus is
-   silent ("Not addressed in the provided documents"). The Citations API
-   returns which chunk/paragraph supports each sentence — this is the
-   `[📄 in your docs]` evidence, with no extra parsing.
+1. **Query rewrite + jurisdiction detect** (a cheap model): expand the query;
+   guess US / CA / unclear.
+2. **Source gathering**:
+   - **Drive RAG**: embed query (Voyage), `ORDER BY embedding <=> q`, top-k
+     (start k≈8) with a similarity floor; optional hybrid full-text for exact
+     terms/citations.
+   - **Web search**: `WebSearch` on authoritative domains + `WebFetch` the top
+     hits for snippets. Every source becomes a tagged `[S#]` item with a link.
+3. **Generate**: free-tier ensemble (or paid Claude) drafts strictly from the
+   `[S#]` set, citing by tag; instructed to **abstain** where sources are
+   silent ("Not addressed in the provided sources").
+4. **Check & consolidate**: the checker merges drafts, validates every claim
+   against its cited source text, drops/flags the unsupported, and returns a
+   single answer with per-claim source mapping + confidence.
 
-In‑chat uploads: a file dropped into a conversation is parsed and embedded into
-a **conversation-scoped** namespace so it's retrievable for that thread without
-polluting the shared corpus.
-
----
-
-## 7. Citation verification (stage 3) — dual jurisdiction
-
-Extract case citations from the draft (Claude + a citation regex pass), then
-**route each citation** to the right provider:
-
-### US → CourtListener  *(free; MCP already available here)*
-- `analyze_citations` — extracts and verifies citations against CourtListener,
-  returning case name, date, and a **hallucination warning** when the cited
-  name doesn't match the reporter. This is close to turnkey for the US side.
-- `search` / `read_document` — pull the real opinion to confirm a proposition.
-
-### Canada → CanLII API  *(user-provided key)*
-Important constraint, designed around honestly:
-
-- The public **CanLII API is metadata + citator only** — it lists databases and
-  returns case metadata (name, citation, court, date) and "cited by / cites"
-  relationships. **It has no free-text case-search endpoint.**
-- Endpoints used:
-  - `caseBrowse/{lang}/{databaseId}/{caseId}` → case metadata (confirm the case
-    exists and get its canonical name/court/date).
-  - `caseCitator/{lang}/{databaseId}/{caseId}/...` → citing/cited relationships
-    (useful as a "still good law?" signal).
-- **Resolving a citation → (databaseId, caseId):** clean for **neutral
-  citations** (e.g. `2019 SCC 65` → db `csc-scc`, case `2019scc65`). For
-  reporter-only citations we first resolve the CanLII URL via a
-  `site:canlii.org` web search (the URL contains db/caseId), then confirm via
-  the API.
-
-**Provider abstraction:** both sit behind one `CitationVerifier` interface
-(`verify(citation) → {status, canonicalName, court, date, url, source}`) so
-adding jurisdictions later is a new adapter, not a rewrite. Results are cached
-in `verification_cache`.
-
-Each citation ends up labelled: **✅ verified**, **✏️ corrected** (real case,
-wrong pincite/name — show the correction), or **⚠️ unverified** (surfaced
-prominently as a caution).
+In‑chat uploads are parsed and embedded into a **conversation‑scoped**
+namespace so they're retrievable for that thread without touching the shared
+corpus.
 
 ---
 
-## 8. Live-law verification (stage 4)
+## 7. Grounding invariant (how "every claim has a link" is enforced)
 
-For the answer's key legal propositions (not every sentence):
-- `WebSearch` scoped to authoritative domains (`canlii.org`,
-  `courtlistener.com`, `laws-lois.justice.gc.ca`, official court/legislature
-  sites) to confirm the rule is current and check for later treatment.
-- `WebFetch` the top source to extract a confirming/contradicting snippet.
-- Attach `[🌐 web-confirmed]` or a **⚠️ possibly outdated** flag with the link.
+1. **Source registry**: each gathered source gets `{id: "S3", type: drive|web,
+   title, url, text}`. Only registry links are allowed in output.
+2. **Generator contract**: answer only from `[S#]`; attach `[S#]` to each
+   claim; if unsupported, say so rather than invent.
+3. **Checker contract** (the enforcement point): for each claim, confirm the
+   cited `[S#]` text actually supports it. Unsupported → drop or mark
+   `⚠️ unverified`. No naked claims survive.
+4. **Render**: UI resolves `[S#]` to clickable source cards (Drive doc / web
+   URL), grouped in the evidence panel.
 
----
-
-## 9. Chat UI & file upload
-
-- Claude-style streaming conversation (Vercel AI SDK `useChat`), conversation
-  history in the sidebar, markdown + citation rendering.
-- **Evidence panel** per assistant message: collapsible source cards grouped by
-  layer (your docs / citation-verified / web) with links (Drive doc, CanLII /
-  CourtListener URL, web source).
-- **File upload**: drag-and-drop into the composer → Supabase Storage → parse →
-  embed into the conversation namespace → immediately retrievable.
-- **Admin view**: list corpus documents, ingestion status, "Sync Drive now".
+This makes grounding independent of any one model's features and directly
+implements "answers shall always come from Google Drive or web search, with
+links, verified by the checker."
 
 ---
 
-## 10. API surface (Next.js route handlers / server actions)
+## 8. Citation verification (stage 4) — dual jurisdiction
+
+Extract case citations from the checked answer, then **route each** to its
+provider. Results cached in `verification_cache`.
+
+### US → CourtListener  *(free; MCP available here)*
+- `analyze_citations` — verifies citations, returns real case name/date, and a
+  **hallucination warning** when the cited name doesn't match the reporter.
+- `search` / `read_document` — pull the opinion to confirm a proposition.
+
+### Canada → CanLII API  *(user key)*
+Designed around a real constraint:
+
+- CanLII's public API is **metadata + citator only** — no free-text case
+  search. So it verifies/enriches citations rather than discovering cases.
+- Endpoints: `caseBrowse/{lang}/{db}/{caseId}` (metadata) and
+  `caseCitator/...` (cited/citing → a "still good law?" signal).
+- **Citation → (db, caseId)**: clean for neutral cites (`2019 SCC 65` → `csc-scc`
+  / `2019scc65`); for reporter-only cites, resolve the CanLII URL via a
+  `site:canlii.org` search first, then confirm via the API.
+
+Both sit behind one `CitationVerifier` interface so new jurisdictions are new
+adapters. Each cite ends up **✅ verified**, **✏️ corrected**, or
+**⚠️ unverified**.
+
+---
+
+## 9. Data model (Supabase)
 
 ```
-POST /api/chat                stream an answer through the 5-stage pipeline
-POST /api/upload              accept an in-chat file → parse → embed
+documents        id, source('gdrive'|'upload'), drive_file_id, title,
+                 mime_type, drive_modified_at, storage_path,
+                 status('pending'|'ingesting'|'ready'|'error'), created_at
+
+chunks           id, document_id→documents, chunk_index, content,
+                 token_count, embedding vector(1024), metadata jsonb
+                 -- hnsw/ivfflat index on embedding
+
+conversations    id, user_id, title, tier('free'|'paid'), created_at
+
+messages         id, conversation_id, role, content,
+                 sources        jsonb   -- the [S#] registry used
+                 verifications  jsonb   -- CanLII/CourtListener results
+                 generator_models jsonb -- which models drafted
+                 checker_model  text
+                 confidence     numeric
+                 created_at
+
+model_runs       id, message_id, role('generator'|'checker'), model,
+                 latency_ms, tokens, raw_output jsonb   -- observability
+
+verification_cache  citation_key pk, provider, result jsonb, fetched_at
+```
+
+RLS on `conversations`/`messages`/`model_runs` (per user). Corpus
+(`documents`/`chunks`) is shared, read-only to users.
+
+---
+
+## 10. Chat UI & file upload
+
+- Claude-style streaming chat (Vercel AI SDK), conversation history sidebar,
+  markdown + inline `[S#]` citation rendering.
+- **Tier toggle** (Free ⇄ Claude) in the composer.
+- **Evidence panel** per answer: source cards grouped 📄 your docs / 🌐 web /
+  ⚖️ citation-verified, plus a small footer: "Drafted by X, Y · Checked by
+  Gemini · Confidence: high".
+- **File upload**: drag-drop → Supabase Storage → parse → embed into the
+  conversation namespace → immediately retrievable.
+- **Admin view**: corpus list, ingestion status, "Sync Drive now".
+
+---
+
+## 11. API surface (Next.js route handlers)
+
+```
+POST /api/chat                run the 5-stage pipeline; stream the final answer
+POST /api/upload              in-chat file → parse → embed (conversation scope)
 POST /api/ingest/sync         (admin) pull changes from the Drive folder
-GET  /api/documents           (admin) list corpus + ingestion status
-POST /api/verify/citation     verify one citation (used internally + debug UI)
+GET  /api/documents           (admin) corpus + ingestion status
+POST /api/verify/citation     verify one citation (internal + debug UI)
 ```
 
 ---
 
-## 11. Security, secrets, compliance
+## 12. Security, secrets, compliance
 
-- **Secrets** (Anthropic, Voyage, CanLII, CourtListener tokens, Google service
-  account, Supabase service-role) live in Vercel/Supabase env vars — never in
-  the repo. A `.env.example` documents the names only.
-- **RLS** on all user-scoped tables; corpus is read-only to end users.
-- **Least-privilege Drive access** — service account scoped to the one corpus
-  folder, read-only.
-- **Not legal advice.** Persistent disclaimer; the product surfaces sources and
-  verification status rather than presenting itself as authoritative counsel.
-- **Respect provider terms** — CanLII/CourtListener rate limits and ToS; cache
-  aggressively; no bulk scraping.
+- **Owner keys** (OpenRouter, Voyage, CanLII, CourtListener, Google service
+  account, Supabase service-role) live in Vercel/Supabase env — never in the
+  repo. `.env.example` documents names only.
+- **Quotas / rate limits** per user to cap cost on owner-funded keys.
+- **RLS** on user-scoped tables; corpus read-only to users.
+- **Least-privilege Drive** — service account scoped to the one folder,
+  read-only.
+- **Not legal advice** — persistent disclaimer; the product surfaces sources +
+  verification status, not authoritative counsel.
+- **Respect provider terms** — CanLII/CourtListener/OpenRouter rate limits &
+  ToS; cache aggressively; no bulk scraping.
 
 ---
 
-## 12. Phased roadmap
+## 13. Phased roadmap
 
 | Phase | Deliverable | Key tasks |
 |-------|-------------|-----------|
-| **0. Scaffold** | Running skeleton | Next.js app, Supabase project (MCP), Google-OAuth login, empty streaming chat. |
-| **1. Ingest + RAG** | Ask → grounded answer | Drive ingestion job, chunk/embed to pgvector, retrieval + Claude Citations answering (layers 1–2). |
-| **2. Citation verify** | Trust layer | `CitationVerifier` interface + CourtListener & CanLII adapters, jurisdiction routing, evidence badges (layer 3). |
-| **3. Web verify** | Freshness layer | Web-search verification of propositions + sources panel (layer 4). |
-| **4. Polish + deploy** | Shippable | In-chat uploads, chat history, admin Drive-sync UI, disclaimers, deploy to Vercel. |
+| **0. Scaffold** | Running skeleton | Next.js app, Supabase (MCP), Google login, empty streaming chat. |
+| **1. Ingest + RAG** | Ask → grounded draft | Drive ingestion, chunk/embed to pgvector, retrieval + web-search source gathering, `[S#]` registry (stages 1–2). |
+| **2. Model orchestration** | Ensemble + checker | `ModelRouter` over OpenRouter, free-tier fan-out, Gemini checker, grounding-invariant enforcement, tier toggle (stage 3, §7). |
+| **3. Citation verify** | Trust layer | `CitationVerifier` + CourtListener & CanLII adapters, jurisdiction routing, evidence badges (stage 4). |
+| **4. Polish + deploy** | Shippable | In-chat uploads, chat history, admin Drive-sync UI, escalation, quotas, disclaimers, deploy to Vercel. |
 
 ---
 
-## 13. Open questions (for after this review)
+## 14. Open questions (for after this review)
 
-1. **Multi-user or personal?** Affects auth/RLS depth and whether the corpus is
-   truly shared. (Assumed: shared curated corpus, per-user chats.)
-2. **Corpus size** (dozens vs thousands of docs) — sets the pgvector index type
-   (`ivfflat` vs `hnsw`) and whether ingestion needs a queue.
-3. **Latency vs thoroughness** — verify *every* citation inline (slower) or
-   draft fast then verify asynchronously and annotate? (Assumed: inline for
-   citations, async-friendly for web.)
-4. **Bilingual (EN/FR) CanLII** content handling.
-5. Exact **CanLII key scope/limits**, to size the cache and rate-limiting.
+1. **Ensemble size & model picks** — which free OpenRouter models, and how many
+   in the fan-out (2? 3?) — trades quality vs. latency/quota.
+2. **Escalation policy** — auto-escalate weak free answers to Claude, or just
+   flag low confidence?
+3. **Multi-user vs personal** — depth of auth/RLS and whether corpus is truly
+   shared. (Assumed: shared corpus, per-user chats.)
+4. **Corpus size** — sets pgvector index (`ivfflat` vs `hnsw`) and whether
+   ingestion needs a queue.
+5. **Bilingual (EN/FR)** CanLII handling; exact **CanLII key limits** (to size
+   caching/rate-limiting).
 
 ---
 
-## 14. Cost sketch (order of magnitude, per question)
+## 15. Cost sketch (order of magnitude, per question)
 
-- Embeddings: fractions of a cent (query + any new upload).
-- Draft + synthesis (Opus/Sonnet split): the dominant cost; controlled by
-  top-k size and answer length.
-- CourtListener: free. CanLII: per user's key terms. Web search: per-call.
-- Caching (`verification_cache`, embedded corpus) keeps steady-state cheap; the
-  one-time corpus embedding is the main upfront cost and scales with corpus size.
+- **Generation**: free-tier models → ~free (bounded by OpenRouter free limits).
+- **Checker**: the main recurring cost — a single Gemini pass (or Claude on the
+  paid tier).
+- **Embeddings**: fractions of a cent per query/upload.
+- **CourtListener** free; **CanLII** per key terms; **web search** per call.
+- **One-time**: corpus embedding, scaling with corpus size.
+- Caching (`verification_cache`, embedded corpus, per-user quotas) keeps
+  steady-state cheap.
 
 ---
 

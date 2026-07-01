@@ -1,15 +1,18 @@
 # research-fact-base
 
 A Claude-style legal research assistant. Ask a legal question and get an answer
-that is **grounded** in a designated document corpus (stored in Google Drive),
-then independently **verified**:
+that is **grounded** in real sources and independently **checked**:
 
-- **Retrieve** relevant passages from your designated documents (RAG).
+- **Gather sources** from a designated Google Drive corpus (RAG) and a live web
+  search — every source carries a link.
+- **Draft** with an ensemble of models (free tier via OpenRouter, or Claude on
+  the paid tier), answering only from those linked sources.
+- **Check & consolidate** with a stronger model (Gemini by default, Claude on
+  the paid tier) that keeps only claims actually supported by a linked source.
 - **Verify citations** against **CanLII** (Canada) and **CourtListener** (US).
-- **Verify the law is current** with a live web search.
 
-Users chat in a familiar Claude-style interface and can upload files directly
-into a conversation.
+Users chat in a familiar Claude-style interface, toggle between a free and a
+paid (Claude) tier, and can upload files directly into a conversation.
 
 ## Status
 
@@ -19,6 +22,7 @@ Early planning. The full architecture and phased build plan is in
 ## Planned stack
 
 Next.js (App Router) · Supabase (Postgres + pgvector + Storage + Auth) ·
-Vercel · Claude (Anthropic API) · Voyage embeddings · Google Drive corpus.
+Vercel · models via OpenRouter (Grok / Gemini / Llama / Claude) ·
+Voyage embeddings · Google Drive corpus.
 
 > This tool provides legal information, not legal advice.
