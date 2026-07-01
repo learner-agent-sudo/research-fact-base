@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+html,
+body {
+  height: 100%;
+}
+
+/* Basic prose styling for streamed Markdown answers. */
+.answer :where(p) {
+  margin: 0.5rem 0;
+  line-height: 1.65;
+}
+.answer :where(ul, ol) {
+  margin: 0.5rem 0;
+  padding-left: 1.25rem;
+}
+.answer :where(ul) {
+  list-style: disc;
+}
+.answer :where(ol) {
+  list-style: decimal;
+}
+.answer :where(li) {
+  margin: 0.2rem 0;
+}
+.answer :where(h1, h2, h3) {
+  font-weight: 600;
+  margin: 0.85rem 0 0.35rem;
+}
+.answer :where(a) {
+  color: #2563eb;
+  text-decoration: underline;
+}
+.answer :where(code) {
+  background: #f1f5f9;
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.25rem;
+  font-size: 0.85em;
+}
+.answer :where(strong) {
+  font-weight: 600;
+}
