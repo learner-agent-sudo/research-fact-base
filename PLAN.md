@@ -19,10 +19,13 @@ conversation.
 |------|----------|
 | **Corpus source** | Documents live in a **Google Drive** folder the user manages; the app ingests from Drive into a vector index. |
 | **Answer grounding** | Answers come **only** from the Drive corpus and/or **live web search**, always **with links**. Enforced app-side (see §7). |
+| **Priority** | **Accuracy over latency.** Broader ensemble + thorough checking; added delay is acceptable. |
 | **Model roles** | **Generator/verifier split.** Free models *draft*; a stronger model *checks*. |
 | **Model gateway** | **OpenRouter** as a single gateway to all models (Grok, Gemini, Llama, Claude, …). |
-| **Generation mode** | **Ensemble** — fan out to several free models in parallel, then consolidate. |
+| **Generation mode** | **Ensemble** — fan out to several (3+) free models in parallel, then consolidate. |
 | **Checker model** | **Gemini by default**; Claude as checker only on the paid tier. |
+| **Escalation** | **User-decided.** Show a confidence indicator + one-click "Re-run with Claude (paid)". No silent auto-escalation. |
+| **Scope** | **Personal (single-user)** for now; the multi-user structure stays latent for later. |
 | **Keys / cost** | **Owner-supplied keys** + a **tier toggle** (free vs. Claude paid). No per-user keys for now. |
 | **Citation verify** | **CourtListener** (US, free) + **CanLII** (Canada, user key), routed by jurisdiction. |
 | **Stack** | **Next.js** + **Supabase** (Postgres/pgvector/Storage/Auth) + **Vercel** + models via **OpenRouter**. |
@@ -96,7 +99,7 @@ cost on the free tier for drafting while spending only on one checker pass.
 | Hosting | **Vercel** | One-command deploy; Vercel MCP available here. |
 | Database + vectors | **Supabase Postgres** + **pgvector** | One store for app data *and* embeddings (`<=>` cosine). Supabase MCP available. |
 | File storage | **Supabase Storage** | In-chat uploads + cached Drive files. |
-| Auth | **Supabase Auth** (Google OAuth) | Same Google identity used for Drive. |
+| Auth | **Supabase Auth** (Google OAuth), **single-user** | Just the owner for now; schema stays multi-user-ready. |
 | **Model gateway** | **OpenRouter** | One API key → Grok, Gemini, Llama, Claude, etc. Swap/add models by config, not code. |
 | Generators (free tier) | Ensemble of free models via OpenRouter | Cheap drafting; resilience via diversity. |
 | Checker | **Gemini** (default) / **Claude** (paid) via OpenRouter | Strong, distinct adjudicator. |
@@ -119,13 +122,11 @@ without code changes.
 ```
 config (env-driven):
   TIERS:
-    free:  generators = [grok, gemini-free, llama-*]   # OpenRouter slugs
+    free:  generators = [grok, gemini-free, llama-*]   # OpenRouter slugs, 3+
            checker    = gemini
     paid:  generators = [claude-opus]                  # or claude + ensemble
            checker    = claude   (fallback gemini)
-  FANOUT:   N parallel drafts on free tier
-  ESCALATE: if checker.confidence < threshold OR unsupported_claims > X
-              → retry with stronger generator / paid model
+  FANOUT:   N parallel drafts on free tier (default 3; accuracy > latency)
 
 roles:
   generator(question, sources[])      -> draft citing [S#]
@@ -135,12 +136,16 @@ roles:
 
 - **Tier toggle** in the UI picks `free` vs `paid`. Owner keys back both; the
   toggle just changes which models the router uses.
-- **Ensemble**: generators run **in parallel** (Promise.all) to hide latency;
-  the checker sees all drafts at once.
-- **Escalation** (optional): a low-confidence or heavily-unsupported result can
-  re-run on a stronger generator before composing.
-- **Cost control**: per-user/day quotas + the ensemble living on free models
-  keep steady-state cost to essentially one checker pass per question.
+- **Ensemble**: generators run **in parallel** (Promise.all) so a wider
+  fan-out costs latency once, not N times. The checker sees all drafts at once.
+- **Accuracy-first checking**: because delay is acceptable, the checker does a
+  thorough claim-by-claim pass and **abstains** rather than guessing when the
+  sources don't support a claim; low-support answers are labelled, not padded.
+- **Escalation is user-decided** (not automatic): every answer carries a
+  **confidence indicator**, and low confidence surfaces a one-click
+  **"Re-run with Claude (paid)"** action. The user chooses when to spend.
+- **Cost control**: per-day quotas + the ensemble living on free models keep
+  steady-state cost to essentially one checker pass per question.
 
 ---
 
@@ -279,6 +284,10 @@ RLS on `conversations`/`messages`/`model_runs` (per user). Corpus
 - Claude-style streaming chat (Vercel AI SDK), conversation history sidebar,
   markdown + inline `[S#]` citation rendering.
 - **Tier toggle** (Free ⇄ Claude) in the composer.
+- **Confidence indicator** on every answer (high / medium / low), driven by the
+  checker's support ratio. When it's not high, a one-click
+  **"Re-run with Claude (paid)"** button lets the user escalate on demand — the
+  decision to spend stays with the user.
 - **Evidence panel** per answer: source cards grouped 📄 your docs / 🌐 web /
   ⚖️ citation-verified, plus a small footer: "Drafted by X, Y · Checked by
   Gemini · Confidence: high".
@@ -305,8 +314,9 @@ POST /api/verify/citation     verify one citation (internal + debug UI)
 - **Owner keys** (OpenRouter, Voyage, CanLII, CourtListener, Google service
   account, Supabase service-role) live in Vercel/Supabase env — never in the
   repo. `.env.example` documents names only.
-- **Quotas / rate limits** per user to cap cost on owner-funded keys.
-- **RLS** on user-scoped tables; corpus read-only to users.
+- **Quotas / rate limits** (per day) to cap cost on owner-funded keys.
+- **Single-user auth** now (owner only); **RLS** on user-scoped tables keeps
+  the door open to multi-user later without a migration.
 - **Least-privilege Drive** — service account scoped to the one folder,
   read-only.
 - **Not legal advice** — persistent disclaimer; the product surfaces sources +
@@ -328,17 +338,20 @@ POST /api/verify/citation     verify one citation (internal + debug UI)
 
 ---
 
-## 14. Open questions (for after this review)
+## 14. Open questions
 
-1. **Ensemble size & model picks** — which free OpenRouter models, and how many
-   in the fan-out (2? 3?) — trades quality vs. latency/quota.
-2. **Escalation policy** — auto-escalate weak free answers to Claude, or just
-   flag low confidence?
-3. **Multi-user vs personal** — depth of auth/RLS and whether corpus is truly
-   shared. (Assumed: shared corpus, per-user chats.)
-4. **Corpus size** — sets pgvector index (`ivfflat` vs `hnsw`) and whether
-   ingestion needs a queue.
-5. **Bilingual (EN/FR)** CanLII handling; exact **CanLII key limits** (to size
+**Resolved:**
+- *Priority* → **accuracy over latency** (broader ensemble, thorough checking).
+- *Escalation* → **user-decided** (confidence indicator + one-click re-run on
+  Claude); no silent auto-escalation.
+- *Scope* → **personal / single-user** for now; schema kept multi-user-ready.
+
+**Still open (fine to settle at build time):**
+1. **Exact model picks** — which specific free OpenRouter models make up the
+   3-model fan-out (I'll propose a diverse default set at Phase 2).
+2. **Corpus size** — sets the pgvector index (`ivfflat` vs `hnsw`) and whether
+   ingestion needs a queue. (Roughly how many documents?)
+3. **Bilingual (EN/FR)** CanLII handling; exact **CanLII key limits** (to size
    caching/rate-limiting).
 
 ---
