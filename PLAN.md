@@ -1,7 +1,8 @@
 # Legal Research Website — Architecture & Build Plan
 
-> Status: **Plan for review** (no application code written yet).
-> Branch: `claude/legal-research-website-jyihm4`
+> Status: **Phases 0–1 built** (scaffold + streaming pipeline + Drive/RAG on
+> provisioned Supabase). Phases 2–4 pending. Branch:
+> `claude/legal-research-website-jyihm4`
 
 A Claude‑style chat application for legal research. A user asks a legal
 question; the system drafts an answer **only** from grounded sources (a
