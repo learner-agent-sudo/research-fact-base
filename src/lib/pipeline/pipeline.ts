@@ -43,7 +43,7 @@ export async function* runPipeline(
 
   const { generators, checker } = modelsForTier(tier);
   const activeGenerators = generators.slice(0, FANOUT);
-  yield { type: "meta", tier, generators: activeGenerators, checker };
+  yield { type: "meta", tier, generators: activeGenerators, checker: checker[0] ?? "unknown" };
 
   try {
     // 2. Generate (ensemble, in parallel).
