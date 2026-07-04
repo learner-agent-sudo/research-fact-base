@@ -43,8 +43,8 @@ rest at runtime.
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | `sb_publishable_d7HEcptiQQyJPtkWUNBTYA_Xur1u94m` | publishable, safe |
 | `SUPABASE_SERVICE_ROLE_KEY` | ‹set your service_role secret› | Supabase → Settings → API |
 | `OPENROUTER_API_KEY` | ‹set your key› | required for answers |
-| `FREE_GENERATORS` | `meta-llama/llama-3.3-70b-instruct,google/gemini-2.0-flash-exp:free,mistralai/mistral-small-3.1-24b-instruct` | verify at openrouter.ai/models |
-| `FREE_CHECKER` | `google/gemini-2.5-flash` | verify slug |
+| `FREE_GENERATORS` | `google/gemini-2.0-flash-exp:free,meta-llama/llama-3.3-70b-instruct:free,deepseek/deepseek-chat-v3-0324:free` | free slugs; verify at openrouter.ai/models |
+| `FREE_CHECKER` | `google/gemini-2.0-flash-exp:free` | free slug |
 | `PAID_GENERATORS` | `anthropic/claude-3.7-sonnet` | verify slug |
 | `PAID_CHECKER` | `anthropic/claude-3.7-sonnet` | verify slug |
 | `FANOUT` | `3` | ensemble size |

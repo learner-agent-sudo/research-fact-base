@@ -6,12 +6,16 @@ import type { Tier } from "@/lib/types";
  * them against https://openrouter.ai/models, as availability changes over time.
  */
 
+// Free-tier defaults use OpenRouter ":free" model variants so a free OpenRouter
+// account works with no credits. Verify availability at openrouter.ai/models —
+// free slugs change over time. NOTE: free models require enabling free-model
+// usage in OpenRouter privacy settings (openrouter.ai/settings/privacy).
 const DEFAULT_FREE_GENERATORS = [
-  "meta-llama/llama-3.3-70b-instruct",
   "google/gemini-2.0-flash-exp:free",
-  "mistralai/mistral-small-3.1-24b-instruct",
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "deepseek/deepseek-chat-v3-0324:free",
 ];
-const DEFAULT_FREE_CHECKER = "google/gemini-2.5-flash";
+const DEFAULT_FREE_CHECKER = "google/gemini-2.0-flash-exp:free";
 
 const DEFAULT_PAID_GENERATORS = ["anthropic/claude-3.7-sonnet"];
 const DEFAULT_PAID_CHECKER = "anthropic/claude-3.7-sonnet";
