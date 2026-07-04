@@ -24,8 +24,9 @@ keys aren't set. Full architecture in **[PLAN.md](./PLAN.md)**.
 
 Wired now: chat UI + tier toggle + streaming (OpenRouter), source registry /
 confidence / escalation, Google Drive ingestion → Voyage embeddings → pgvector,
-similarity retrieval, admin corpus page (`/admin`). Pending: citation
-verification against CanLII/CourtListener (Phase 3), auth + deploy (Phase 4).
+similarity retrieval, admin corpus page (`/admin`), and **citation verification**
+(US → CourtListener, Canada → CanLII) with cached results and badges. Pending:
+auth + deploy to Vercel (Phase 4).
 
 The Supabase project (`research-fact-base`, `us-east-1`, free tier) is already
 provisioned with the schema and RLS applied.
@@ -63,6 +64,18 @@ the chat answers are grounded in them with `[S#]` citations.
 The database schema lives in `supabase/migrations/` and is already applied to
 the provisioned project.
 
+### Enabling citation verification (optional)
+
+Answers are verified for real case citations once you add:
+
+- **`COURTLISTENER_API_TOKEN`** — free from courtlistener.com (verifies US
+  citations, flags fabricated ones).
+- **`CANLII_API_KEY`** — your CanLII key (verifies Canadian neutral citations
+  like `2019 SCC 65` against CanLII's metadata API).
+
+Results appear as ✅ verified / ⚠️ unverified badges under each answer and are
+cached in the `verification_cache` table.
+
 ### Layout
 
 ```
@@ -75,6 +88,7 @@ src/lib/embeddings/        Voyage embeddings client
 src/lib/drive/             Google Drive service-account client
 src/lib/ingest/            parse + chunk + embed + upsert pipeline
 src/lib/supabase/          server (service-role) client
+src/lib/verify/            citation verification (CourtListener + CanLII, cached)
 src/lib/search/            web-search source provider (Tavily)
 src/app/admin/             corpus admin page (Sync Drive, document list)
 supabase/migrations/       pgvector schema + RLS

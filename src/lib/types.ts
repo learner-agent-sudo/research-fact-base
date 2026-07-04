@@ -28,10 +28,24 @@ export interface CheckerMeta {
   unsupported: string[]; // claims dropped or flagged as unverified
 }
 
+export type CitationStatus = "verified" | "corrected" | "unverified";
+
+export interface CitationVerification {
+  citation: string; // the citation string as it appears in the answer
+  jurisdiction: "US" | "CA" | "unknown";
+  provider: "courtlistener" | "canlii" | null;
+  status: CitationStatus;
+  caseName?: string;
+  date?: string;
+  url?: string;
+  note?: string;
+}
+
 // NDJSON events streamed from POST /api/chat
 export type StreamEvent =
   | { type: "sources"; sources: Source[] }
   | { type: "meta"; tier: Tier; generators: string[]; checker: string }
   | { type: "delta"; text: string }
+  | { type: "verifications"; items: CitationVerification[] }
   | { type: "done"; confidence: Confidence; unsupported: string[] }
   | { type: "error"; message: string };

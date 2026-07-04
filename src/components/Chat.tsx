@@ -15,10 +15,22 @@ interface Source {
   snippet: string;
 }
 
+interface CitationVerification {
+  citation: string;
+  jurisdiction: "US" | "CA" | "unknown";
+  provider: "courtlistener" | "canlii" | null;
+  status: "verified" | "corrected" | "unverified";
+  caseName?: string;
+  date?: string;
+  url?: string;
+  note?: string;
+}
+
 interface Msg {
   role: "user" | "assistant";
   content: string;
   sources?: Source[];
+  verifications?: CitationVerification[];
   generators?: string[];
   checker?: string;
   tier?: Tier;
@@ -101,6 +113,9 @@ export default function Chat() {
               break;
             case "delta":
               appendLast(ev.text as string);
+              break;
+            case "verifications":
+              patchLast({ verifications: ev.items as CitationVerification[] });
               break;
             case "done":
               patchLast({ confidence: ev.confidence as Confidence, unsupported: ev.unsupported as string[], streaming: false });
@@ -250,6 +265,8 @@ function Bubble({ m, onEscalate, busy }: { m: Msg; onEscalate: () => void; busy:
 
       {m.sources && m.sources.length > 0 && <Sources sources={m.sources} />}
 
+      {m.verifications && m.verifications.length > 0 && <Verifications items={m.verifications} />}
+
       {m.unsupported && m.unsupported.length > 0 && (
         <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
           <span className="font-medium">Flagged / unverified:</span> {m.unsupported.join("; ")}
@@ -276,6 +293,50 @@ function Bubble({ m, onEscalate, busy }: { m: Msg; onEscalate: () => void; busy:
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+const VERIFY_BADGE: Record<CitationVerification["status"], { icon: string; style: string; label: string }> = {
+  verified: { icon: "✅", style: "border-green-200 bg-green-50 text-green-800", label: "verified" },
+  corrected: { icon: "✏️", style: "border-amber-200 bg-amber-50 text-amber-800", label: "corrected" },
+  unverified: { icon: "⚠️", style: "border-red-200 bg-red-50 text-red-800", label: "unverified" },
+};
+
+function Verifications({ items }: { items: CitationVerification[] }) {
+  return (
+    <div className="mt-3 rounded-lg border border-neutral-200 bg-white p-3">
+      <div className="mb-2 text-xs font-medium text-neutral-600">
+        Citation checks ({items.length})
+      </div>
+      <ul className="space-y-1.5">
+        {items.map((v, i) => {
+          const badge = VERIFY_BADGE[v.status];
+          return (
+            <li key={i} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs">
+              <span className={`rounded-full border px-1.5 py-0.5 font-medium ${badge.style}`}>
+                {badge.icon} {badge.label}
+              </span>
+              <span className="font-mono text-neutral-700">{v.citation}</span>
+              <span className="text-[10px] uppercase text-neutral-400">{v.provider || v.jurisdiction}</span>
+              {v.caseName && (
+                <span className="text-neutral-600">
+                  —{" "}
+                  {v.url ? (
+                    <a href={v.url} target="_blank" rel="noreferrer" className="text-blue-600 underline">
+                      {v.caseName}
+                    </a>
+                  ) : (
+                    v.caseName
+                  )}
+                  {v.date ? ` (${v.date})` : ""}
+                </span>
+              )}
+              {v.note && !v.caseName && <span className="text-neutral-400">{v.note}</span>}
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }

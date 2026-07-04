@@ -3,6 +3,8 @@ import { OpenRouterMissingKeyError } from "@/lib/models/openrouter";
 import { retrieve } from "@/lib/retrieval/retriever";
 import { webSearch } from "@/lib/search/websearch";
 import type { ChatMessage, Source, StreamEvent, Tier } from "@/lib/types";
+import { verifyCitations } from "@/lib/verify";
+import type { CheckerMeta } from "@/lib/types";
 import { runChecker } from "./check";
 import { runGenerators } from "./generate";
 import { tagSources } from "./sources";
@@ -47,11 +49,29 @@ export async function* runPipeline(
     // 2. Generate (ensemble, in parallel).
     const drafts = await runGenerators(activeGenerators, question, history, sources, signal);
 
-    // 3. Check & consolidate (streamed).
+    // 3. Check & consolidate (streamed); accumulate the answer for verification.
+    let answer = "";
+    let meta: CheckerMeta | null = null;
     for await (const ev of runChecker(checker, question, history, sources, drafts, signal)) {
-      if (ev.kind === "delta") yield { type: "delta", text: ev.text };
-      else yield { type: "done", confidence: ev.meta.confidence, unsupported: ev.meta.unsupported };
+      if (ev.kind === "delta") {
+        answer += ev.text;
+        yield { type: "delta", text: ev.text };
+      } else {
+        meta = ev.meta;
+      }
     }
+
+    // 4. Verify case citations (US → CourtListener, CA → CanLII). Best-effort.
+    if (answer.trim()) {
+      const items = await verifyCitations(answer).catch(() => []);
+      if (items.length) yield { type: "verifications", items };
+    }
+
+    yield {
+      type: "done",
+      confidence: meta?.confidence ?? (sources.length ? "medium" : "low"),
+      unsupported: meta?.unsupported ?? [],
+    };
   } catch (err) {
     if (err instanceof OpenRouterMissingKeyError) {
       yield { type: "delta", text: NO_KEY_MESSAGE };
