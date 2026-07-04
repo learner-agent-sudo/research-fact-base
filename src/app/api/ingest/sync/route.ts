@@ -2,7 +2,9 @@ import { syncCorpus } from "@/lib/ingest/ingest";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 300; // large first ingests can take a while
+// 60s keeps within Vercel's Hobby-plan limit. Large first-time ingests of big
+// files are best run locally (npm run dev); Vercel handles incremental syncs.
+export const maxDuration = 60;
 
 /** Optional admin gate: if ADMIN_TOKEN is set, require it in x-admin-token. */
 function authorized(req: Request): boolean {
