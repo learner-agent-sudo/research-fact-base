@@ -37,16 +37,39 @@ export default function Admin() {
 
   async function sync() {
     setSyncing(true);
-    setLog("Syncing the Drive corpus…");
+    setLog("Syncing the Drive corpus… (this runs in batches and may take a few rounds)");
     try {
-      const res = await fetch("/api/ingest/sync", { method: "POST" });
-      const data = await res.json();
-      setLog(data.error ? `Error: ${data.error}` : JSON.stringify(data.results, null, 2));
-      await load();
+      // Ingestion is resumable and time-boxed per request; loop until done.
+      for (let round = 1; round <= 60; round++) {
+        const res = await fetch("/api/ingest/sync", { method: "POST" });
+        const text = await res.text();
+
+        let data: { error?: string; done?: boolean; remaining?: number } | null = null;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          // A batch hit Vercel's 60s cap — progress was saved, so resume.
+          setLog(`Round ${round}: a batch timed out, resuming…`);
+          await load();
+          continue;
+        }
+
+        if (data?.error) {
+          setLog(`Error: ${data.error}`);
+          break;
+        }
+        await load();
+        if (data?.done) {
+          setLog("✅ Sync complete — all documents embedded.");
+          break;
+        }
+        setLog(`Ingesting… ${data?.remaining ?? "?"} chunks remaining (round ${round}). Keeping going…`);
+      }
     } catch (e) {
       setLog(`Error: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setSyncing(false);
+      await load();
     }
   }
 
