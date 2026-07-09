@@ -35,36 +35,50 @@ jobs:
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
           set -uo pipefail
-          if [ -z "${APP_URL:-}" ]; then
-            echo "::error::APP_URL secret is not set."; exit 1
-          fi
-          endpoint="${APP_URL%/}/api/ingest/sync"
-          echo "Ingesting via $endpoint"
 
+          # Sanitize + validate the URL up front so a malformed secret fails
+          # fast with a clear message instead of looping.
+          APP_URL="$(printf '%s' "${APP_URL:-}" | tr -d '[:space:]')"
+          case "$APP_URL" in
+            https://*|http://*) ;;
+            "") echo "::error::APP_URL secret is empty."; exit 1 ;;
+            *) echo "::error::APP_URL must start with https:// — the saved secret looks malformed. Re-enter it exactly, e.g. https://research-fact-base.vercel.app"; exit 1 ;;
+          esac
+          endpoint="${APP_URL%/}/api/ingest/sync"
+          echo "Ingesting via ${endpoint}"
+
+          fails=0
           for i in $(seq 1 400); do
             http=$(curl -sS -m 90 -o resp.json -w "%{http_code}" -X POST "$endpoint" \
               -H "x-admin-token: ${ADMIN_TOKEN:-}" \
               -H "x-vercel-protection-bypass: ${VERCEL_BYPASS:-}" \
-              -H "x-vercel-set-bypass-cookie: true" || echo "000")
+              -H "x-vercel-set-bypass-cookie: true" 2>curlerr.txt) || http="000"
             body=$(cat resp.json 2>/dev/null || echo "")
 
+            if [ "$http" = "000" ]; then
+              fails=$((fails + 1))
+              echo "round $i: request failed — $(head -c 160 curlerr.txt) [failure $fails/5]"
+              if [ "$fails" -ge 5 ]; then
+                echo "::error::Request failed 5 times in a row. Check the APP_URL secret."
+                exit 1
+              fi
+              sleep 5; continue
+            fi
+            fails=0
+
             case "$http" in
-              401|403|302|307)
-                echo "::error::Request blocked (HTTP $http). Check VERCEL_AUTOMATION_BYPASS_SECRET (and ADMIN_TOKEN if set)."
-                echo "$body" | head -c 300; exit 1 ;;
-              000)
-                echo "round $i: request failed, retrying…"; sleep 5; continue ;;
-              504|502|503)
+              401 | 403 | 302 | 307)
+                echo "::error::Blocked (HTTP $http). Check VERCEL_AUTOMATION_BYPASS_SECRET (and ADMIN_TOKEN if you set one)."
+                head -c 300 resp.json; exit 1 ;;
+              5??)
                 echo "round $i: batch timed out (HTTP $http) — progress saved, resuming…"; sleep 5; continue ;;
             esac
 
-            err=$(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null)
-            if [ -z "$err" ] && ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
-              echo "round $i: non-JSON response, resuming…"; sleep 5; continue
+            if ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+              echo "round $i: non-JSON response (HTTP $http), resuming…"; sleep 5; continue
             fi
-            if [ -n "$err" ]; then
-              echo "::error::Ingestion error: $err"; exit 1
-            fi
+            err=$(printf '%s' "$body" | jq -r '.error // empty')
+            if [ -n "$err" ]; then echo "::error::Ingestion error: $err"; exit 1; fi
 
             done=$(printf '%s' "$body" | jq -r '.done // false')
             remaining=$(printf '%s' "$body" | jq -r '.remaining // "?"')
