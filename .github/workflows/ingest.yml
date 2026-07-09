@@ -1,0 +1,78 @@
+name: Ingest Drive corpus
+
+# Runs the resumable /api/ingest/sync endpoint in a loop, server-side, until the
+# whole Google Drive corpus is embedded. No browser needed — it runs on GitHub's
+# infrastructure. Trigger it manually (Run workflow) or let the daily schedule
+# pick up new/changed files automatically.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   APP_URL                            e.g. https://research-fact-base.vercel.app
+#   VERCEL_AUTOMATION_BYPASS_SECRET    from Vercel → Settings → Deployment
+#                                      Protection → Protection Bypass for Automation
+# Optional:
+#   ADMIN_TOKEN                        if you set ADMIN_TOKEN in Vercel env
+#
+# See docs/BACKGROUND_INGEST.md for the full setup walkthrough.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC — auto-sync new Drive files
+
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Ingest until complete
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          VERCEL_BYPASS: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${APP_URL:-}" ]; then
+            echo "::error::APP_URL secret is not set."; exit 1
+          fi
+          endpoint="${APP_URL%/}/api/ingest/sync"
+          echo "Ingesting via $endpoint"
+
+          for i in $(seq 1 400); do
+            http=$(curl -sS -m 90 -o resp.json -w "%{http_code}" -X POST "$endpoint" \
+              -H "x-admin-token: ${ADMIN_TOKEN:-}" \
+              -H "x-vercel-protection-bypass: ${VERCEL_BYPASS:-}" \
+              -H "x-vercel-set-bypass-cookie: true" || echo "000")
+            body=$(cat resp.json 2>/dev/null || echo "")
+
+            case "$http" in
+              401|403|302|307)
+                echo "::error::Request blocked (HTTP $http). Check VERCEL_AUTOMATION_BYPASS_SECRET (and ADMIN_TOKEN if set)."
+                echo "$body" | head -c 300; exit 1 ;;
+              000)
+                echo "round $i: request failed, retrying…"; sleep 5; continue ;;
+              504|502|503)
+                echo "round $i: batch timed out (HTTP $http) — progress saved, resuming…"; sleep 5; continue ;;
+            esac
+
+            err=$(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null)
+            if [ -z "$err" ] && ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+              echo "round $i: non-JSON response, resuming…"; sleep 5; continue
+            fi
+            if [ -n "$err" ]; then
+              echo "::error::Ingestion error: $err"; exit 1
+            fi
+
+            done=$(printf '%s' "$body" | jq -r '.done // false')
+            remaining=$(printf '%s' "$body" | jq -r '.remaining // "?"')
+            echo "round $i: remaining chunks = $remaining"
+            if [ "$done" = "true" ]; then
+              echo "✅ Ingestion complete."; exit 0
+            fi
+            sleep 3
+          done
+
+          echo "::warning::Reached the round cap without finishing. Re-run this workflow to continue."

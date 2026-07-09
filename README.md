@@ -58,8 +58,13 @@ retrieval you still need three secrets:
    `GDRIVE_CORPUS_FOLDER_ID`.
 
 Then open **`/admin`** and click **“Sync Drive now”** to ingest. Supported
-files: Markdown, text, DOCX, PDF, and Google Docs. Once documents show `ready`,
-the chat answers are grounded in them with `[S#]` citations.
+files: Markdown, text, DOCX, PDF, and Google Docs. Ingestion is resumable and
+runs in batches, so it survives Vercel's 60s function limit. Once documents show
+`ready`, the chat answers are grounded in them with `[S#]` citations.
+
+For large corpora, use the **background ingestion** GitHub Action instead of the
+browser — it runs server-side until done and re-syncs daily. See
+**[docs/BACKGROUND_INGEST.md](./docs/BACKGROUND_INGEST.md)**.
 
 The database schema lives in `supabase/migrations/` and is already applied to
 the provisioned project.
