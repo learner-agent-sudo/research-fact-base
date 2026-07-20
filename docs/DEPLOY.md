@@ -48,8 +48,8 @@ rest at runtime.
 | `PAID_GENERATORS` | `anthropic/claude-3.7-sonnet` | verify slug |
 | `PAID_CHECKER` | `anthropic/claude-3.7-sonnet` | verify slug |
 | `FANOUT` | `3` | ensemble size |
-| `VOYAGE_API_KEY` | ‹set your key› | for RAG |
-| `VOYAGE_MODEL` | `voyage-law-2` | 1024-dim, matches schema |
+| `GEMINI_API_KEY` | ‹set your key› | embeddings for RAG — free key, no card (aistudio.google.com) |
+| `VOYAGE_API_KEY` | ‹optional› | alternative embeddings (voyage-law-2; fast with billing) |
 | `TAVILY_API_KEY` | ‹set your key› | optional web-search source |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | ‹set stringified JSON› | Drive read access |
 | `GDRIVE_CORPUS_FOLDER_ID` | ‹set folder id› | corpus folder |

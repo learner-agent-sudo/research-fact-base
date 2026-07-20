@@ -7,11 +7,16 @@ daily schedule keeps the index in sync as you add files to Drive.
 
 ## One-time setup (~5 minutes)
 
-### 1. Add the Voyage payment method (free)
-Ingestion speed is gated by Voyage's rate limit. Without a card you're throttled
-to 3 requests/min. Add a card at **dashboard.voyageai.com → Billing** — you keep
-the 200M free tokens (far more than your corpus needs); the card only lifts the
-speed limit. Do this or the background job will crawl.
+### 1. Set the embeddings key (free, no card)
+Get a **free Gemini API key** at **aistudio.google.com/app/apikey** (no payment
+method needed) and add it to Vercel env as **`GEMINI_API_KEY`**, then redeploy.
+Free tiers are still rate-limited, so a large first ingest may take a few hours
+— that's exactly why this job runs unattended in the background; it backs off
+and resumes automatically.
+
+*(Alternative: `VOYAGE_API_KEY` with a billing card added at voyageai.com is the
+fastest path. If you switch providers after some chunks were embedded, reset
+them first: `UPDATE chunks SET embedding = NULL;` in the Supabase SQL editor.)*
 
 ### 2. Turn on Vercel's automation bypass
 The site is protected by Vercel login, so the job needs a key to get in.

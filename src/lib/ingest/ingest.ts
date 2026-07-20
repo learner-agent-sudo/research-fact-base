@@ -1,5 +1,5 @@
 import { downloadFile, driveConfigured, listCorpusFiles, type DriveFile } from "@/lib/drive/client";
-import { embedDocuments, embeddingsConfigured, toVectorLiteral } from "@/lib/embeddings/voyage";
+import { embedDocuments, embeddingsConfigured, toVectorLiteral } from "@/lib/embeddings";
 import { supabaseAdmin } from "@/lib/supabase/server";
 import { chunkText } from "./chunk";
 import { parseFile } from "./parse";
@@ -21,9 +21,11 @@ export interface SyncResult {
 // the admin page loops until `done`. Progress is committed continuously, so a
 // timeout (or a new call) simply resumes where the last left off.
 const TIME_BUDGET_MS = 45_000;
-const MATERIALIZE_CUTOFF_MS = 15_000; // don't START parsing a new file after this
-const EMBED_BATCH = 32;
+const MATERIALIZE_CUTOFF_MS = 30_000; // don't START parsing a new file after this
+// Small embed batches keep each request under free-tier token-per-minute caps.
+const EMBED_BATCH = Math.max(1, Number(process.env.EMBED_BATCH || 16));
 const INSERT_BATCH = 200;
+const RATE_LIMIT_BACKOFF_MS = 20_000;
 
 /**
  * Resumable Google Drive → vector-store sync. A document moves through:
@@ -119,6 +121,9 @@ export async function syncCorpus(): Promise<SyncResult> {
   }
 
   // 3. Embed pending chunks (embedding IS NULL) until the time budget is spent.
+  //    Free embedding tiers rate-limit aggressively: back off and retry within
+  //    the budget instead of failing the whole call; anything unfinished simply
+  //    resumes on the next call. Non-rate-limit errors (bad key etc.) still throw.
   while (elapsed() < TIME_BUDGET_MS) {
     const { data: pending } = await supabase
       .from("chunks")
@@ -127,7 +132,21 @@ export async function syncCorpus(): Promise<SyncResult> {
       .limit(EMBED_BATCH);
     if (!pending || pending.length === 0) break;
 
-    const embeddings = await embedDocuments(pending.map((p) => p.content as string));
+    let embeddings: number[][];
+    try {
+      embeddings = await embedDocuments(pending.map((p) => p.content as string));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/\b429\b|rate.?limit|quota|resource.?exhausted/i.test(msg)) {
+        if (elapsed() < TIME_BUDGET_MS - RATE_LIMIT_BACKOFF_MS - 5_000) {
+          await new Promise((r) => setTimeout(r, RATE_LIMIT_BACKOFF_MS));
+          continue;
+        }
+        results.push({ file: "(embedding)", status: "skipped", error: "rate-limited — resuming next round" });
+        break;
+      }
+      throw e;
+    }
     await Promise.all(
       pending.map((p, i) =>
         supabase.from("chunks").update({ embedding: toVectorLiteral(embeddings[i]) }).eq("id", p.id),

@@ -1,4 +1,4 @@
-import { embedQuery, embeddingsConfigured, toVectorLiteral } from "@/lib/embeddings/voyage";
+import { embedQuery, embeddingsConfigured, toVectorLiteral } from "@/lib/embeddings";
 import { supabaseAdmin } from "@/lib/supabase/server";
 import type { Source } from "@/lib/types";
 
