@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "ingest": "node scripts/ingest.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

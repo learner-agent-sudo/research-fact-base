@@ -1,23 +1,25 @@
 name: Ingest Drive corpus
 
-# Runs the resumable /api/ingest/sync endpoint in a loop, server-side, until the
-# whole Google Drive corpus is embedded. No browser needed — it runs on GitHub's
-# infrastructure. Trigger it manually (Run workflow) or let the daily schedule
-# pick up new/changed files automatically.
+# Runs the standalone ingestion script (scripts/ingest.mjs) on GitHub's runners.
+# It reads Google Drive and writes vectors to Supabase DIRECTLY — it does NOT
+# call the Vercel site, so it can never affect the website's usage/uptime.
+#
+# Manual only for now (no schedule) so it never runs unexpectedly. Since this job
+# no longer touches Vercel, you can safely re-enable the schedule below later.
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
-#   APP_URL                            e.g. https://research-fact-base.vercel.app
-#   VERCEL_AUTOMATION_BYPASS_SECRET    from Vercel → Settings → Deployment
-#                                      Protection → Protection Bypass for Automation
-# Optional:
-#   ADMIN_TOKEN                        if you set ADMIN_TOKEN in Vercel env
+#   SUPABASE_URL                     https://<ref>.supabase.co
+#   SUPABASE_SERVICE_ROLE_KEY        Supabase → Settings → API → service_role
+#   GEMINI_API_KEY                   aistudio.google.com/app/apikey (free, no card)
+#   GOOGLE_SERVICE_ACCOUNT_JSON      the service-account JSON (whole file)
+#   GDRIVE_CORPUS_FOLDER_ID          the Drive folder to load (e.g. an "Approved" folder)
 #
-# See docs/BACKGROUND_INGEST.md for the full setup walkthrough.
+# See docs/BACKGROUND_INGEST.md for the walkthrough.
 
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: "0 6 * * *" # daily at 06:00 UTC — auto-sync new Drive files
+  # schedule:
+  #   - cron: "0 6 * * 1"   # weekly, Mondays 06:00 UTC — safe (does not touch Vercel)
 
 concurrency:
   group: ingest
@@ -28,65 +30,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
-      - name: Ingest until complete
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - name: Ingest corpus
         env:
-          APP_URL: ${{ secrets.APP_URL }}
-          VERCEL_BYPASS: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
-        run: |
-          set -uo pipefail
-
-          # Sanitize + validate the URL up front so a malformed secret fails
-          # fast with a clear message instead of looping.
-          APP_URL="$(printf '%s' "${APP_URL:-}" | tr -d '[:space:]')"
-          case "$APP_URL" in
-            https://*|http://*) ;;
-            "") echo "::error::APP_URL secret is empty."; exit 1 ;;
-            *) echo "::error::APP_URL must start with https:// — the saved secret looks malformed. Re-enter it exactly, e.g. https://research-fact-base.vercel.app"; exit 1 ;;
-          esac
-          endpoint="${APP_URL%/}/api/ingest/sync"
-          echo "Ingesting via ${endpoint}"
-
-          fails=0
-          for i in $(seq 1 400); do
-            http=$(curl -sS -m 90 -o resp.json -w "%{http_code}" -X POST "$endpoint" \
-              -H "x-admin-token: ${ADMIN_TOKEN:-}" \
-              -H "x-vercel-protection-bypass: ${VERCEL_BYPASS:-}" \
-              -H "x-vercel-set-bypass-cookie: true" 2>curlerr.txt) || http="000"
-            body=$(cat resp.json 2>/dev/null || echo "")
-
-            if [ "$http" = "000" ]; then
-              fails=$((fails + 1))
-              echo "round $i: request failed — $(head -c 160 curlerr.txt) [failure $fails/5]"
-              if [ "$fails" -ge 5 ]; then
-                echo "::error::Request failed 5 times in a row. Check the APP_URL secret."
-                exit 1
-              fi
-              sleep 5; continue
-            fi
-            fails=0
-
-            case "$http" in
-              401 | 403 | 302 | 307)
-                echo "::error::Blocked (HTTP $http). Check VERCEL_AUTOMATION_BYPASS_SECRET (and ADMIN_TOKEN if you set one)."
-                head -c 300 resp.json; exit 1 ;;
-              5??)
-                echo "round $i: batch timed out (HTTP $http) — progress saved, resuming…"; sleep 5; continue ;;
-            esac
-
-            if ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
-              echo "round $i: non-JSON response (HTTP $http), resuming…"; sleep 5; continue
-            fi
-            err=$(printf '%s' "$body" | jq -r '.error // empty')
-            if [ -n "$err" ]; then echo "::error::Ingestion error: $err"; exit 1; fi
-
-            done=$(printf '%s' "$body" | jq -r '.done // false')
-            remaining=$(printf '%s' "$body" | jq -r '.remaining // "?"')
-            echo "round $i: remaining chunks = $remaining"
-            if [ "$done" = "true" ]; then
-              echo "✅ Ingestion complete."; exit 0
-            fi
-            sleep 3
-          done
-
-          echo "::warning::Reached the round cap without finishing. Re-run this workflow to continue."
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_CORPUS_FOLDER_ID: ${{ secrets.GDRIVE_CORPUS_FOLDER_ID }}
+        run: npm run ingest

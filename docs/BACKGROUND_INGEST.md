@@ -1,60 +1,77 @@
-# Background ingestion (no browser needed)
+# Loading your documents (the "Librarian")
 
-The `.github/workflows/ingest.yml` GitHub Action runs the resumable
-`/api/ingest/sync` endpoint in a loop, on GitHub's servers, until your whole
-Google Drive corpus is embedded. It runs even with your computer off, and a
-daily schedule keeps the index in sync as you add files to Drive.
+Ingestion runs **outside the website**, as a standalone job (`scripts/ingest.mjs`).
+It reads your Google Drive folder (recursively), extracts text, chunks, embeds
+with Gemini, and writes vectors to Supabase — talking to Drive and the database
+**directly**. It never calls the Vercel site, so it can't affect the website's
+uptime or usage. Run it two ways:
 
-## One-time setup (~5 minutes)
+- **In the background (laptop can be off):** a GitHub Action.
+- **On your own computer:** `npm run ingest`.
 
-### 1. Set the embeddings key (free, no card)
-Get a **free Gemini API key** at **aistudio.google.com/app/apikey** (no payment
-method needed) and add it to Vercel env as **`GEMINI_API_KEY`**, then redeploy.
-Free tiers are still rate-limited, so a large first ingest may take a few hours
-— that's exactly why this job runs unattended in the background; it backs off
-and resumes automatically.
+Either way it can run for hours, backs off when a free API rate-limits it, skips
+files it can't read, and prints a **report** of what loaded / was skipped / failed.
 
-*(Alternative: `VOYAGE_API_KEY` with a billing card added at voyageai.com is the
-fastest path. If you switch providers after some chunks were embedded, reset
-them first: `UPDATE chunks SET embedding = NULL;` in the Supabase SQL editor.)*
+## What it loads (curation)
 
-### 2. Turn on Vercel's automation bypass
-The site is protected by Vercel login, so the job needs a key to get in.
-- Vercel → your **research-fact-base** project → **Settings → Deployment Protection**.
-- Enable **Protection Bypass for Automation**.
-- **Copy the generated secret.**
+It loads everything under the folder in `GDRIVE_CORPUS_FOLDER_ID`, **including
+subfolders**. To control what's in the library, point that at a dedicated folder
+(e.g. an **"Approved"** subfolder) and only put documents you want searchable
+there. Supported: Markdown, text, PDF (text-based), DOCX, Google Docs.
+**Scanned/image-only PDFs** (no extractable text) are automatically **skipped and
+listed in the report** so you can decide whether to OCR them.
 
-### 3. Find your production URL
-Vercel → project → **Domains** → copy the Production URL, e.g.
-`https://research-fact-base.vercel.app`.
+---
 
-### 4. Add the secrets to GitHub
-GitHub → `research-fact-base` repo → **Settings → Secrets and variables →
-Actions → New repository secret**. Add:
+## Option A — GitHub Action (background, unattended)
 
-| Secret name | Value |
-|-------------|-------|
-| `APP_URL` | your production URL from step 3 |
-| `VERCEL_AUTOMATION_BYPASS_SECRET` | the secret from step 2 |
+### 1. Get a free Gemini key
+**aistudio.google.com/app/apikey** → Create API key (no payment card needed).
 
-(Optional: `ADMIN_TOKEN` — only if you also set `ADMIN_TOKEN` in Vercel env vars.)
+### 2. Add repository secrets
+GitHub → `research-fact-base` → **Settings → Secrets and variables → Actions →
+New repository secret**. Add all five:
 
-## Run it
+| Secret | Value |
+|--------|-------|
+| `SUPABASE_URL` | `https://zfzydmozafepouflrlxb.supabase.co` |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase → Settings → API → `service_role` |
+| `GEMINI_API_KEY` | the key from step 1 |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | the whole service-account JSON file |
+| `GDRIVE_CORPUS_FOLDER_ID` | the Drive folder id to load |
 
-- **On demand:** GitHub → **Actions** tab → **Ingest Drive corpus** → **Run workflow**.
-  Watch the log — it prints `remaining chunks = N` each round and ends with
-  `✅ Ingestion complete.`
-- **Automatically:** it also runs **daily at 06:00 UTC** to pick up any files you
-  added to the Drive folder. (Edit the `cron` line in the workflow to change this.)
+*(No Vercel bypass secret is needed anymore — the job doesn't touch Vercel.)*
 
-When it finishes, open the chat and ask a question — answers are grounded in your
-documents. You can confirm progress any time on the `/admin` page (documents flip
-to `ready`).
+### 3. Run it
+GitHub → **Actions → Ingest Drive corpus → Run workflow.** Watch the log: it prints
+each file as it embeds and ends with an **INGEST REPORT**. Files flip to `ready`
+in the app's `/admin` page as they finish.
+
+*(A weekly schedule is included but commented out in the workflow — safe to enable
+whenever you like, since it never touches Vercel.)*
+
+---
+
+## Option B — Run locally
+
+```bash
+# in the project folder, with the same values in .env.local:
+#   SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY,
+#   GEMINI_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON, GDRIVE_CORPUS_FOLDER_ID
+npm install
+node --env-file=.env.local scripts/ingest.mjs    # Node 20+
+```
+
+Your computer must stay on while it runs, but there are no cloud limits.
+
+---
 
 ## Notes
 
-- The job resumes automatically if a batch times out; progress is always saved.
-- If a run hits the round cap without finishing (very large corpus), just run it
-  again — it continues where it left off.
-- The `/admin` "Sync Drive now" button still works too, if you ever want to run a
-  sync from the browser.
+- **Re-runs are cheap:** unchanged files (same Drive modified-time, already
+  `ready`) are skipped, so running again only processes new/changed files.
+- **Switching embedding provider** invalidates old vectors (different math). If
+  you ever switch, reset first in the Supabase SQL editor:
+  `UPDATE chunks SET embedding = NULL;` then re-run ingest.
+- The website (`/admin` "Sync") still does small top-ups, but bulk loading should
+  go through this job so the site stays light.

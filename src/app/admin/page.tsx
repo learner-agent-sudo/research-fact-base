@@ -35,41 +35,31 @@ export default function Admin() {
     load();
   }, [load]);
 
+  // A single lightweight round. Bulk ingestion is done by the background job
+  // (scripts/ingest.mjs via GitHub Actions), which never loads Vercel. This
+  // button is only for a quick top-up / status check.
   async function sync() {
     setSyncing(true);
-    setLog("Syncing the Drive corpus… (this runs in batches and may take a few rounds)");
+    setLog("Running one ingest round…");
     try {
-      // Ingestion is resumable and time-boxed per request; loop until done.
-      for (let round = 1; round <= 60; round++) {
-        const res = await fetch("/api/ingest/sync", { method: "POST" });
-        const text = await res.text();
-
-        let data: { error?: string; done?: boolean; remaining?: number } | null = null;
-        try {
-          data = JSON.parse(text);
-        } catch {
-          // A batch hit Vercel's 60s cap — progress was saved, so resume.
-          setLog(`Round ${round}: a batch timed out, resuming…`);
-          await load();
-          continue;
-        }
-
-        if (data?.error) {
-          setLog(`Error: ${data.error}`);
-          break;
-        }
+      const res = await fetch("/api/ingest/sync", { method: "POST" });
+      const text = await res.text();
+      let data: { error?: string; done?: boolean; remaining?: number } | null = null;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        setLog("A batch timed out (Vercel's 60s limit). For a full load, use the background job — see docs/BACKGROUND_INGEST.md.");
         await load();
-        if (data?.done) {
-          setLog("✅ Sync complete — all documents embedded.");
-          break;
-        }
-        setLog(`Ingesting… ${data?.remaining ?? "?"} chunks remaining (round ${round}). Keeping going…`);
+        return;
       }
+      if (data?.error) setLog(`Error: ${data.error}`);
+      else if (data?.done) setLog("✅ Up to date — everything is embedded.");
+      else setLog(`${data?.remaining ?? "?"} chunks still need embedding. For a full load, run the background job (docs/BACKGROUND_INGEST.md) instead of clicking repeatedly here.`);
+      await load();
     } catch (e) {
       setLog(`Error: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setSyncing(false);
-      await load();
     }
   }
 
