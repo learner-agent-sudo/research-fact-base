@@ -50,10 +50,19 @@ const jwt = new JWT({
   key: sa.private_key,
   scopes: ["https://www.googleapis.com/auth/drive.readonly"],
 });
+// Google access tokens expire after ~1h. A full ingest runs much longer than
+// that, so cache the token and re-authorize before it lapses — otherwise every
+// download past the one-hour mark fails with HTTP 401.
+let tokenCache = { value: null, expiresAt: 0 };
 async function driveToken() {
-  const { access_token } = await jwt.authorize();
-  if (!access_token) throw new Error("Failed to get Google access token");
-  return access_token;
+  const now = Date.now();
+  if (tokenCache.value && now < tokenCache.expiresAt) return tokenCache.value;
+  const creds = await jwt.authorize();
+  if (!creds.access_token) throw new Error("Failed to get Google access token");
+  // Refresh 5 minutes early rather than racing the expiry.
+  const expiry = creds.expiry_date ? creds.expiry_date - 5 * 60_000 : now + 50 * 60_000;
+  tokenCache = { value: creds.access_token, expiresAt: expiry };
+  return tokenCache.value;
 }
 
 const MIME = {
@@ -90,7 +99,6 @@ async function listFolder(folderId, token) {
 
 // Recurse through subfolders so nested/messy structures are all covered.
 async function listCorpusFiles(rootId) {
-  const token = await driveToken();
   const out = [];
   const stack = [rootId];
   const seen = new Set();
@@ -98,7 +106,7 @@ async function listCorpusFiles(rootId) {
     const fid = stack.pop();
     if (seen.has(fid)) continue;
     seen.add(fid);
-    const items = await listFolder(fid, token);
+    const items = await listFolder(fid, await driveToken());
     for (const it of items) {
       if (it.mimeType === MIME.FOLDER) stack.push(it.id);
       else out.push(it);
@@ -119,7 +127,12 @@ async function download(file, token) {
     file.mimeType === MIME.GDOC
       ? `https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/plain&supportsAllDrives=true`
       : `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&supportsAllDrives=true`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  let res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (res.status === 401) {
+    // Token lapsed mid-run: force a refresh and retry once.
+    tokenCache = { value: null, expiresAt: 0 };
+    res = await fetch(url, { headers: { Authorization: `Bearer ${await driveToken()}` } });
+  }
   if (!res.ok) throw new Error(`download ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
 }
@@ -225,8 +238,6 @@ async function main() {
   const seen = new Set();
   const report = { loaded: [], unchanged: [], skipped: [], errored: [] };
 
-  const token = await driveToken();
-
   for (const f of files) {
     seen.add(f.id);
     try {
@@ -265,7 +276,8 @@ async function main() {
         docId = data.id;
       }
 
-      const buf = await download(f, token);
+      // Fetch per file so a long run always uses a live (auto-refreshed) token.
+      const buf = await download(f, await driveToken());
       const text = await parse(f, buf);
       const chunks = chunkText(text);
 
