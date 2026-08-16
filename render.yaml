@@ -1,0 +1,44 @@
+# Render blueprint — free hosting for the research site.
+#
+# Render runs the app as an ordinary Node server (`next start`), so no code
+# changes or platform adapters are needed. Ingestion does NOT run here (it lives
+# in scripts/ingest.mjs via GitHub Actions), so this service stays light.
+#
+# Setup: render.com → New → Blueprint → connect this repo → Apply.
+# Then fill in the environment variables marked sync:false (Render prompts you).
+# See docs/DEPLOY_RENDER.md for the walkthrough.
+
+services:
+  - type: web
+    name: research-fact-base
+    runtime: node
+    plan: free
+    branch: claude/legal-research-website-jyihm4
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # --- Required: set these in the Render dashboard ---
+      # NEXT_PUBLIC_* are read at BUILD time, so they must be present before the
+      # build step runs (Render sets env vars for build and runtime alike).
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      # --- Optional ---
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: CANLII_API_KEY
+        sync: false
+      - key: COURTLISTENER_API_TOKEN
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
