@@ -18,8 +18,11 @@ name: Ingest Drive corpus
 
 on:
   workflow_dispatch: {}
-  # schedule:
-  #   - cron: "0 6 * * 1"   # weekly, Mondays 06:00 UTC — safe (does not touch Vercel)
+  # Daily: free embedding tiers have a per-DAY quota, so a large corpus needs
+  # several runs. Each run resumes exactly where the last stopped, so the corpus
+  # fills in over a few days unattended. Safe — this never touches the web host.
+  schedule:
+    - cron: "0 6 * * *"
 
 concurrency:
   group: ingest
@@ -28,7 +31,9 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    # The script now exits cleanly when the daily quota is spent, so a run should
+    # finish in well under an hour. This cap is a backstop, not the plan.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

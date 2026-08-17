@@ -74,6 +74,14 @@ const MIME = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Free embedding tiers have both per-minute and per-DAY quotas. Per-minute
+// limits clear in under a minute; a daily quota does not clear for hours, so
+// cap the retries and end the run cleanly rather than looping until the CI
+// timeout (which previously burned 5.5h doing nothing).
+const MAX_RATE_LIMIT_RETRIES = Number(process.env.MAX_RATE_LIMIT_RETRIES || 6);
+
+class QuotaExhausted extends Error {}
+
 async function listFolder(folderId, token) {
   const files = [];
   let pageToken;
@@ -213,6 +221,12 @@ async function embedBatch(texts) {
     const body = await res.text().catch(() => "");
     if (status === 429 || status >= 500) {
       attempt++;
+      if (attempt > MAX_RATE_LIMIT_RETRIES) {
+        // Per-minute limits recover in seconds; a wall this persistent means the
+        // free tier's DAILY quota is spent. Stop cleanly instead of spinning for
+        // hours — progress is already saved, and the next run resumes.
+        throw new QuotaExhausted(`embedding quota exhausted after ${attempt} retries (HTTP ${status})`);
+      }
       const wait = Math.min(60000, 2000 * 2 ** Math.min(attempt, 5));
       console.log(`  embed HTTP ${status} — backing off ${Math.round(wait / 1000)}s (attempt ${attempt})…`);
       await sleep(wait);
@@ -237,6 +251,7 @@ async function main() {
   const byId = new Map((existing || []).map((d) => [d.drive_file_id, d]));
   const seen = new Set();
   const report = { loaded: [], unchanged: [], skipped: [], errored: [] };
+  let quotaHit = null;
 
   for (const f of files) {
     seen.add(f.id);
@@ -253,12 +268,29 @@ async function main() {
       }
 
       let docId = prev?.id;
+      // Resume a part-done file instead of restarting it: chunking is
+      // deterministic, so chunk_index N always maps to the same text. On a free
+      // daily quota this is what lets successive runs accumulate.
+      let resumeFrom = 0;
       if (docId) {
+        const unchanged = prev.drive_modified_at === f.modifiedTime;
         await supabase
           .from("documents")
           .update({ title: f.name, mime_type: f.mimeType, drive_modified_at: f.modifiedTime, status: "ingesting" })
           .eq("id", docId);
-        await supabase.from("chunks").delete().eq("document_id", docId);
+        if (unchanged) {
+          const { count } = await supabase
+            .from("chunks")
+            .select("id", { count: "exact", head: true })
+            .eq("document_id", docId);
+          resumeFrom = count ?? 0;
+          // Drop a trailing partial batch so re-inserts can't collide.
+          if (resumeFrom > 0) {
+            await supabase.from("chunks").delete().eq("document_id", docId).gte("chunk_index", resumeFrom);
+          }
+        } else {
+          await supabase.from("chunks").delete().eq("document_id", docId);
+        }
       } else {
         const { data, error } = await supabase
           .from("documents")
@@ -287,8 +319,17 @@ async function main() {
         continue;
       }
 
-      console.log(`Embedding "${f.name}" — ${chunks.length} chunks…`);
-      for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
+      if (resumeFrom >= chunks.length) {
+        await supabase.from("documents").update({ status: "ready" }).eq("id", docId);
+        report.unchanged.push(`${f.name} (already complete)`);
+        continue;
+      }
+      console.log(
+        `Embedding "${f.name}" — ${chunks.length} chunks` +
+          (resumeFrom ? ` (resuming at ${resumeFrom})` : "") +
+          "…",
+      );
+      for (let i = resumeFrom; i < chunks.length; i += EMBED_BATCH) {
         const batch = chunks.slice(i, i + EMBED_BATCH);
         const embs = await embedBatch(batch);
         const rows = batch.map((c, j) => ({
@@ -304,17 +345,28 @@ async function main() {
       await supabase.from("documents").update({ status: "ready" }).eq("id", docId);
       report.loaded.push(`${f.name} (${chunks.length} chunks)`);
     } catch (e) {
+      if (e instanceof QuotaExhausted) {
+        // Out of daily quota: stop the run here. Everything embedded so far is
+        // committed, and the next run picks up mid-file where this one stopped.
+        quotaHit = `${f.name}: ${e.message}`;
+        console.log(`\n⏸  ${e.message}`);
+        console.log("   Stopping early — progress is saved and the next run resumes here.");
+        break;
+      }
       const msg = e?.message || String(e);
       report.errored.push(`${f.name}: ${msg}`);
       console.log(`  ERROR "${f.name}": ${msg}`);
     }
   }
 
-  // Remove documents whose Drive file has disappeared.
-  for (const [fid, doc] of byId) {
-    if (fid && !seen.has(fid)) {
-      await supabase.from("documents").delete().eq("id", doc.id);
-      report.skipped.push(`(removed missing file ${fid})`);
+  // Remove documents whose Drive file has disappeared. Skipped when we stopped
+  // early, since `seen` is then incomplete and would delete healthy documents.
+  if (!quotaHit) {
+    for (const [fid, doc] of byId) {
+      if (fid && !seen.has(fid)) {
+        await supabase.from("documents").delete().eq("id", doc.id);
+        report.skipped.push(`(removed missing file ${fid})`);
+      }
     }
   }
 
@@ -331,7 +383,22 @@ async function main() {
     .from("chunks")
     .select("id", { count: "exact", head: true })
     .not("embedding", "is", null);
+  const { count: notReady } = await supabase
+    .from("documents")
+    .select("id", { count: "exact", head: true })
+    .neq("status", "ready");
+
   console.log(`\nTotal embedded chunks now in the database: ${count}`);
+  if (quotaHit) {
+    console.log(`\n⏸  STOPPED EARLY — embedding quota exhausted (${quotaHit}).`);
+    console.log(`   ${notReady} document(s) still incomplete.`);
+    console.log("   Re-run this workflow after the quota resets (usually next day);");
+    console.log("   it continues from exactly where it stopped.");
+  } else if ((notReady ?? 0) > 0) {
+    console.log(`\n${notReady} document(s) still incomplete — re-run to continue.`);
+  } else {
+    console.log("\n✅ All documents are ready.");
+  }
   console.log("Done.");
 }
 
