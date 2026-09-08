@@ -1,0 +1,16 @@
+.git
+.github
+node_modules
+.next
+out
+docs
+scratchpad
+
+# Never let local secrets into the image — HF injects them at runtime.
+.env
+.env.local
+.env*.local
+
+npm-debug.log*
+.DS_Store
+README.md

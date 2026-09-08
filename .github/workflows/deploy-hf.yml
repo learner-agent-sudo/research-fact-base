@@ -1,0 +1,96 @@
+name: Deploy to Hugging Face Space
+
+# Mirrors this repo into a Hugging Face Space, which rebuilds the Docker image
+# and restarts the app. HF Spaces are free with no payment card, and a PRIVATE
+# Space is visible only to your HF account — which also gives the site the login
+# protection it otherwise lacks.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   HF_TOKEN   a Hugging Face access token with WRITE permission
+#              (huggingface.co/settings/tokens)
+#   HF_SPACE   the Space id, e.g. "your-username/research-fact-base"
+#
+# App secrets (OPENROUTER_API_KEY, Supabase keys, …) are NOT set here — add them
+# in the Space itself under Settings → Variables and secrets. See
+# docs/DEPLOY_HF.md.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [claude/legal-research-website-jyihm4]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+concurrency:
+  group: deploy-hf
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: ${{ secrets.HF_SPACE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HF_TOKEN:-}" ]; then echo "::error::HF_TOKEN secret is not set."; exit 1; fi
+          if [ -z "${HF_SPACE:-}" ]; then echo "::error::HF_SPACE secret is not set (e.g. your-username/research-fact-base)."; exit 1; fi
+
+          work="$(mktemp -d)"
+          remote="https://user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}"
+
+          if ! git clone --depth 1 "$remote" "$work" 2>/dev/null; then
+            echo "Space repo not clonable yet — initialising a fresh one."
+            rm -rf "$work" && mkdir -p "$work"
+            git -C "$work" init -q -b main
+            git -C "$work" remote add origin "$remote"
+          fi
+
+          # Mirror the repo into the Space, preserving the Space's own git dir.
+          rsync -a --delete \
+            --exclude '.git/' \
+            --exclude 'node_modules/' \
+            --exclude '.next/' \
+            ./ "$work/"
+
+          # HF reads this front matter to configure the Space. It must live in
+          # the Space's README.md, so it is generated here rather than kept in
+          # the GitHub README.
+          cat > "$work/README.md" <<'SPACE_README'
+          ---
+          title: Research Fact Base
+          emoji: "⚖️"
+          colorFrom: blue
+          colorTo: indigo
+          sdk: docker
+          app_port: 7860
+          pinned: false
+          short_description: Grounded legal research over your own documents
+          ---
+
+          Legal research assistant that answers only from your own Google Drive
+          corpus and verified sources, with citation checking.
+
+          Deployed automatically from
+          [learner-agent-sudo/research-fact-base](https://github.com/learner-agent-sudo/research-fact-base).
+
+          Configure API keys under **Settings -> Variables and secrets**.
+          SPACE_README
+
+          cd "$work"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to deploy."
+            exit 0
+          fi
+          git commit -q -m "Deploy from GitHub @ ${GITHUB_SHA::7}"
+          git push origin HEAD:main
+          echo "Deployed to https://huggingface.co/spaces/${HF_SPACE}"
