@@ -20,8 +20,10 @@ on:
   # Daily: free embedding tiers have a per-DAY quota, so a large corpus needs
   # several runs. Each run resumes exactly where the last stopped, so the corpus
   # fills in over a few days unattended. Safe — this never touches the web host.
+  # 09:00 UTC is after Gemini's daily reset (midnight US Pacific), so each run
+  # starts with a fresh quota.
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 9 * * *"
 
 concurrency:
   group: ingest

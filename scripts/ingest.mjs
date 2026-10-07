@@ -238,6 +238,11 @@ async function embedBatch(texts) {
 
 const toVec = (v) => `[${v.join(",")}]`;
 
+// Drive sends "…:56.000Z" but Postgres hands back "…:56+00:00" for the same
+// instant, so compare times, not strings. A string compare marks every file
+// "changed" and re-embeds the whole corpus from scratch on every run.
+const sameTime = (a, b) => a != null && b != null && Date.parse(a) === Date.parse(b);
+
 async function main() {
   console.log(`Listing Drive folder ${FOLDER_ID} (recursive)…`);
   const all = await listCorpusFiles(FOLDER_ID);
@@ -257,7 +262,7 @@ async function main() {
     seen.add(f.id);
     try {
       const prev = byId.get(f.id);
-      if (prev && prev.drive_modified_at === f.modifiedTime && prev.status === "ready") {
+      if (prev && sameTime(prev.drive_modified_at, f.modifiedTime) && prev.status === "ready") {
         report.unchanged.push(f.name);
         continue;
       }
@@ -273,7 +278,7 @@ async function main() {
       // daily quota this is what lets successive runs accumulate.
       let resumeFrom = 0;
       if (docId) {
-        const unchanged = prev.drive_modified_at === f.modifiedTime;
+        const unchanged = sameTime(prev.drive_modified_at, f.modifiedTime);
         await supabase
           .from("documents")
           .update({ title: f.name, mime_type: f.mimeType, drive_modified_at: f.modifiedTime, status: "ingesting" })

@@ -45,7 +45,7 @@ GitHub → **Actions → Ingest Drive corpus → Run workflow.** Watch the log: 
 each file as it embeds and ends with an **INGEST REPORT**. Files flip to `ready`
 in the app's `/admin` page as they finish.
 
-It also runs **daily at 06:00 UTC**. Free embedding tiers have a per-day quota,
+It also runs **daily at 09:00 UTC** (just after the free quota resets). Free embedding tiers have a per-day quota,
 so a large corpus may take several runs: when the quota runs out the job stops
 cleanly, and the next run resumes exactly where it left off.
 
