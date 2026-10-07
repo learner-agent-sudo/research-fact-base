@@ -3,8 +3,8 @@
 Ingestion runs **outside the website**, as a standalone job (`scripts/ingest.mjs`).
 It reads your Google Drive folder (recursively), extracts text, chunks, embeds
 with Gemini, and writes vectors to Supabase — talking to Drive and the database
-**directly**. It never calls the Vercel site, so it can't affect the website's
-uptime or usage. Run it two ways:
+**directly**. It never calls the website or its API, so loading can't affect
+the site's uptime or usage limits. Run it two ways:
 
 - **In the background (laptop can be off):** a GitHub Action.
 - **On your own computer:** `npm run ingest`.
@@ -40,15 +40,14 @@ New repository secret**. Add all five:
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | the whole service-account JSON file |
 | `GDRIVE_CORPUS_FOLDER_ID` | the Drive folder id to load |
 
-*(No Vercel bypass secret is needed anymore — the job doesn't touch Vercel.)*
-
 ### 3. Run it
 GitHub → **Actions → Ingest Drive corpus → Run workflow.** Watch the log: it prints
 each file as it embeds and ends with an **INGEST REPORT**. Files flip to `ready`
 in the app's `/admin` page as they finish.
 
-*(A weekly schedule is included but commented out in the workflow — safe to enable
-whenever you like, since it never touches Vercel.)*
+It also runs **daily at 06:00 UTC**. Free embedding tiers have a per-day quota,
+so a large corpus may take several runs: when the quota runs out the job stops
+cleanly, and the next run resumes exactly where it left off.
 
 ---
 
@@ -73,5 +72,5 @@ Your computer must stay on while it runs, but there are no cloud limits.
 - **Switching embedding provider** invalidates old vectors (different math). If
   you ever switch, reset first in the Supabase SQL editor:
   `UPDATE chunks SET embedding = NULL;` then re-run ingest.
-- The website (`/admin` "Sync") still does small top-ups, but bulk loading should
-  go through this job so the site stays light.
+- This job is the only way documents get loaded — the website just reads them.
+  The site's **Corpus** page shows what's ready and links here.

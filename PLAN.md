@@ -1,8 +1,15 @@
 # Legal Research Website — Architecture & Build Plan
 
-> Status: **Phases 0–3 built** (scaffold + streaming pipeline + Drive/RAG on
-> provisioned Supabase + dual-jurisdiction citation verification). Phase 4
-> (auth + deploy) pending. Branch: `claude/legal-research-website-jyihm4`
+> **Superseded architecture.** This is the original plan (Vercel-hosted Next.js
+> server). The app now runs as a static site on GitHub Pages with the backend in
+> a Supabase Edge Function, a closed document corpus, and deterministic
+> citation/quote checks in place of web search and external citation lookups —
+> see [README.md](./README.md) and
+> [docs/DEPLOY_GITHUB_PAGES.md](./docs/DEPLOY_GITHUB_PAGES.md). Kept for history.
+
+> Status (original plan): **Phases 0–3 built** (scaffold + streaming pipeline +
+> Drive/RAG on provisioned Supabase + dual-jurisdiction citation verification).
+> Branch: `claude/legal-research-website-jyihm4`
 
 A Claude‑style chat application for legal research. A user asks a legal
 question; the system drafts an answer **only** from grounded sources (a

@@ -1,11 +1,10 @@
 name: Ingest Drive corpus
 
 # Runs the standalone ingestion script (scripts/ingest.mjs) on GitHub's runners.
-# It reads Google Drive and writes vectors to Supabase DIRECTLY — it does NOT
-# call the Vercel site, so it can never affect the website's usage/uptime.
+# It reads Google Drive and writes vectors to Supabase DIRECTLY — it never calls
+# the website or its API, so loading can't affect the site's usage limits.
 #
-# Manual only for now (no schedule) so it never runs unexpectedly. Since this job
-# no longer touches Vercel, you can safely re-enable the schedule below later.
+# Runs daily (below) and on demand via "Run workflow".
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
 #   SUPABASE_URL                     https://<ref>.supabase.co

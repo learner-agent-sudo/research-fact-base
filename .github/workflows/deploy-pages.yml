@@ -1,0 +1,62 @@
+name: Deploy site to GitHub Pages
+
+# Builds the static site (Next.js export) and publishes it to
+# https://<owner>.github.io/<repo>/.
+#
+# The site holds no secrets — only public Supabase values. Document search, the
+# AI models and the grounding checks run in the `research-api` Supabase Edge
+# Function, which requires a signed-in user on the ALLOWED_EMAILS list.
+# See docs/DEPLOY_GITHUB_PAGES.md.
+
+on:
+  push:
+    branches: [claude/legal-research-website-jyihm4]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "scripts/**"
+      - ".github/workflows/ingest.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Test edge function (grounding checks, auth, pipeline)
+        run: npm run test:edge
+      - name: Build static site
+        run: npm run build
+        env:
+          # Public by design (see src/lib/supabase.ts) — not secrets.
+          NEXT_PUBLIC_SUPABASE_URL: https://zfzydmozafepouflrlxb.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: sb_publishable_d7HEcptiQQyJPtkWUNBTYA_Xur1u94m
+          NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+          NEXT_PUBLIC_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

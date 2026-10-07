@@ -5,9 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start",
     "ingest": "node scripts/ingest.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:edge": "node --experimental-strip-types --no-warnings --test supabase/functions/research-api/*.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",

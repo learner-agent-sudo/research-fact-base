@@ -1,108 +1,68 @@
 # research-fact-base
 
-A Claude-style legal research assistant. Ask a legal question and get an answer
-that is **grounded** in real sources and independently **checked**:
+A legal research assistant that answers **only from your own documents** — and
+checks its own work in code before you see anything.
 
-- **Gather sources** from a designated Google Drive corpus (RAG) and a live web
-  search — every source carries a link.
-- **Draft** with an ensemble of models (free tier via OpenRouter, or Claude on
-  the paid tier), answering only from those linked sources.
-- **Check & consolidate** with a stronger model (Gemini by default, Claude on
-  the paid tier) that keeps only claims actually supported by a linked source.
-- **Verify citations** against **CanLII** (Canada) and **CourtListener** (US).
+1. **Search** your Google Drive corpus (semantic search over embedded passages).
+2. **Draft** with an ensemble of models (free models via OpenRouter, or Claude
+   on the paid tier), told to use only those passages.
+3. **Check** with a stronger model that consolidates the drafts and drops
+   unsupported claims.
+4. **Verify in code** — deterministic checks remove any sentence that:
+   - cites a case, case name or statute **not found in the retrieved passages**;
+   - quotes text that **doesn't appear word-for-word** in a passage;
+   - tags a source that wasn't retrieved.
 
-Users chat in a familiar Claude-style interface, toggle between a free and a
-paid (Claude) tier, and can upload files directly into a conversation.
+   Every removal is shown to you with its reason, supporting quotes are marked
+   ✓ verified / ⚠ wrong source / ✗ not found, and you can open the exact
+   passages the AI was given. If nothing relevant is found, it says so instead
+   of answering.
 
-## Status
-
-**Phases 0–1 are in place.** A runnable Next.js app with a Claude-style
-streaming chat, the full answer pipeline (source gathering → free-model ensemble
-→ checker consolidation), and **RAG over a Google Drive corpus** backed by a
-provisioned Supabase pgvector database. Everything degrades gracefully where API
-keys aren't set. Full architecture in **[PLAN.md](./PLAN.md)**.
-
-Wired now: chat UI + tier toggle + streaming (OpenRouter), source registry /
-confidence / escalation, Google Drive ingestion → Voyage embeddings → pgvector,
-similarity retrieval, admin corpus page (`/admin`), and **citation verification**
-(US → CourtListener, Canada → CanLII) with cached results and badges. Pending:
-auth + deploy to Vercel (Phase 4).
-
-The Supabase project (`research-fact-base`, `us-east-1`, free tier) is already
-provisioned with the schema and RLS applied.
-
-## Getting started
-
-```bash
-cp .env.example .env.local     # then add at least OPENROUTER_API_KEY
-npm install
-npm run dev                    # http://localhost:3000
-```
-
-Without keys the app still runs and streams a message telling you what to
-configure. To enable grounded answers set `OPENROUTER_API_KEY` (and optionally
-`TAVILY_API_KEY` for the web-search source). Verify the model slugs in
-`.env.example` against <https://openrouter.ai/models>.
-
-### Enabling the Google Drive corpus (RAG)
-
-`.env.local` already has the provisioned Supabase URL + anon key. To turn on
-retrieval you still need three secrets:
-
-1. **`SUPABASE_SERVICE_ROLE_KEY`** — Supabase dashboard → Project Settings →
-   API → `service_role` (secret). Server-side only; bypasses RLS.
-2. **`VOYAGE_API_KEY`** — from voyageai.com (default model `voyage-law-2`).
-3. **Google Drive** — create a service account, download its JSON key into
-   `GOOGLE_SERVICE_ACCOUNT_JSON` (stringified), and **share the corpus folder**
-   with the service-account email (read-only). Put the folder id in
-   `GDRIVE_CORPUS_FOLDER_ID`.
-
-Then open **`/admin`** and click **“Sync Drive now”** to ingest. Supported
-files: Markdown, text, DOCX, PDF, and Google Docs. Ingestion is resumable and
-runs in batches, so it survives Vercel's 60s function limit. Once documents show
-`ready`, the chat answers are grounded in them with `[S#]` citations.
-
-For large corpora, use the **background ingestion** GitHub Action instead of the
-browser — it runs server-side until done and re-syncs daily. See
-**[docs/BACKGROUND_INGEST.md](./docs/BACKGROUND_INGEST.md)**.
-
-The database schema lives in `supabase/migrations/` and is already applied to
-the provisioned project.
-
-### Enabling citation verification (optional)
-
-Answers are verified for real case citations once you add:
-
-- **`COURTLISTENER_API_TOKEN`** — free from courtlistener.com (verifies US
-  citations, flags fabricated ones).
-- **`CANLII_API_KEY`** — your CanLII key (verifies Canadian neutral citations
-  like `2019 SCC 65` against CanLII's metadata API).
-
-Results appear as ✅ verified / ⚠️ unverified badges under each answer and are
-cached in the `verification_cache` table.
-
-### Layout
-
-```
-src/app/                  Next.js App Router (chat page + /api/chat)
-src/components/Chat.tsx    streaming chat UI
-src/lib/pipeline/          the 5-stage pipeline (sources, generate, check)
-src/lib/models/            OpenRouter gateway client
-src/lib/retrieval/         pgvector similarity retriever (Voyage query embed)
-src/lib/embeddings/        Voyage embeddings client
-src/lib/drive/             Google Drive service-account client
-src/lib/ingest/            parse + chunk + embed + upsert pipeline
-src/lib/supabase/          server (service-role) client
-src/lib/verify/            citation verification (CourtListener + CanLII, cached)
-src/lib/search/            web-search source provider (Tavily)
-src/app/admin/             corpus admin page (Sync Drive, document list)
-supabase/migrations/       pgvector schema + RLS
-```
-
-## Planned stack
-
-Next.js (App Router) · Supabase (Postgres + pgvector + Storage + Auth) ·
-Vercel · models via OpenRouter (Grok / Gemini / Llama / Claude) ·
-Voyage embeddings · Google Drive corpus.
+No unverified text is ever displayed: you see progress steps, then the checked
+answer.
 
 > This tool provides legal information, not legal advice.
+
+## Architecture
+
+| Piece | Where | What |
+|---|---|---|
+| Website | GitHub Pages | static Next.js export: sign-in, chat, corpus page |
+| API | Supabase Edge Function `research-api` | holds the keys; search → draft → check → verify |
+| Data | Supabase Postgres + pgvector | documents, embedded passages |
+| Ingest | GitHub Actions (daily) | loads Drive files → embeddings |
+
+The site is public by nature but useless without signing in: the API only
+answers signed-in users whose email is on the `ALLOWED_EMAILS` list.
+
+**Setup:** [docs/DEPLOY_GITHUB_PAGES.md](./docs/DEPLOY_GITHUB_PAGES.md) ·
+**Loading documents:** [docs/BACKGROUND_INGEST.md](./docs/BACKGROUND_INGEST.md)
+
+## Layout
+
+```
+src/app/                         pages: chat (/) and corpus status (/admin)
+src/components/AuthGate.tsx      email magic-link sign-in
+src/components/Chat.tsx          chat UI + source-check panels
+src/lib/supabase.ts              Supabase client + API helper
+supabase/functions/research-api/ the backend
+  index.ts                         HTTP routes, auth, streaming
+  pipeline.ts                      retrieval, model ensemble, checker
+  grounding.ts                     deterministic citation / quote checks
+  *.test.ts                        tests (npm run test:edge)
+supabase/migrations/             database schema
+scripts/ingest.mjs               Drive → embeddings loader (GitHub Actions)
+```
+
+## Development
+
+```bash
+npm install
+cp .env.example .env.local   # public Supabase values are prefilled
+npm run dev                  # http://localhost:3000 — talks to the deployed API
+npm run test:edge            # backend tests
+npm run build                # static export to out/
+```
+
+To sign in locally, add `http://localhost:3000/` to Supabase → Authentication →
+URL Configuration → Redirect URLs.

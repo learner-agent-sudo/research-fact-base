@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Research Fact Base — Legal Research",
   description:
-    "Grounded, verified legal research: answers drawn only from your documents and the web, checked before you see them.",
+    "Grounded legal research: answers drawn only from your own documents, with every citation and quote checked before you see them.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -3,7 +3,7 @@
  * Standalone corpus ingestion — runs OUTSIDE the website (locally or in GitHub
  * Actions). Reads the designated Google Drive folder (recursively), extracts
  * text, chunks, embeds with Gemini (free tier, with backoff), and writes vectors
- * to Supabase. It can run for hours and never touches Vercel.
+ * to Supabase. It can run for hours and never touches the website or its API.
  *
  * Env required:
  *   SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY,
