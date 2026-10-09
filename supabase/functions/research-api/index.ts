@@ -3,13 +3,17 @@
  *
  * Routes (all under /functions/v1/research-api):
  *   GET  /health     - which secrets are configured (no auth, booleans only)
+ *   GET  /me         - is this caller allowed? (the site checks before showing the app)
  *   GET  /documents  - corpus status for the admin page        (auth required)
  *   POST /chat       - NDJSON stream of pipeline events         (auth required)
  *
  * Auth: the caller must send a Supabase Auth session token for a user whose
  * email is in the ALLOWED_EMAILS secret. Verified here via /auth/v1/user rather
  * than the gateway's verify_jwt (deployed with verify_jwt=false) because CORS
- * preflights carry no token and the gateway would reject them.
+ * preflights carry no token and the gateway would reject them. The project's
+ * service key is also accepted, so the live smoke test (scripts/smoke.mjs, run
+ * by GitHub Actions) can exercise the real pipeline; that key already grants
+ * full database access, so accepting it here grants nothing new.
  *
  * Secrets (Supabase -> Edge Functions -> Secrets):
  *   OPENROUTER_API_KEY, GEMINI_API_KEY, ALLOWED_EMAILS (comma-separated)
@@ -122,30 +126,81 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-/** Returns the caller's email, or an error Response to send back. */
+/** Identity returned for callers holding the project's service key (the live smoke test). */
+export const SERVICE_CALLER = "service-key";
+
+/** Every server-side key of this project: the legacy service_role JWT and any new sb_secret_ keys. */
+function serviceKeys(): string[] {
+  const keys: unknown[] = [env("SUPABASE_SERVICE_ROLE_KEY")];
+  try {
+    keys.push(...Object.values(JSON.parse(env("SUPABASE_SECRET_KEYS") ?? "{}")));
+  } catch {
+    // not set / not JSON
+  }
+  return keys.filter((k): k is string => typeof k === "string" && k !== "");
+}
+
+function sameString(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/**
+ * True if `token` is a service-level key for this project. Checked against the
+ * injected keys first; failing that, by asking Auth's admin API to accept it, so
+ * either key format works whichever one is stored in the GitHub secret.
+ */
+async function isServiceKey(token: string): Promise<boolean> {
+  if (serviceKeys().some((k) => sameString(k, token))) return true;
+  if (!/^(sb_secret_|eyJ)/.test(token)) return false;
+  const headers: Record<string, string> = { apikey: token };
+  if (token.startsWith("eyJ")) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(`${supabaseUrl()}/auth/v1/admin/users?page=1&per_page=1`, { headers });
+  await res.body?.cancel();
+  return res.ok;
+}
+
+/**
+ * Returns the caller's identity (an allowlisted email, or SERVICE_CALLER), or an
+ * error Response to send back.
+ */
 async function authorize(req: Request): Promise<string | Response> {
   const token = (req.headers.get("Authorization") ?? "").match(/^Bearer\s+(\S+)$/i)?.[1];
   if (!token) return json({ error: "Not signed in." }, 401);
+  if (serviceKeys().some((k) => sameString(k, token))) return SERVICE_CALLER;
+
+  const res = await fetch(`${supabaseUrl()}/auth/v1/user`, {
+    headers: { apikey: publicKey(), Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    await res.body?.cancel();
+    if (await isServiceKey(token)) return SERVICE_CALLER;
+    return json({ error: "Your session has expired. Please sign in again." }, 401);
+  }
+  const email = String((await res.json())?.email ?? "").toLowerCase();
 
   const allowed = list("ALLOWED_EMAILS", []).map((e) => e.toLowerCase());
   if (!allowed.length) {
     return json(
       {
         error:
-          "The server has no ALLOWED_EMAILS configured, so nobody can sign in yet. " +
-          "Add your email in Supabase \u2192 Edge Functions \u2192 Secrets.",
+          "The server has no ALLOWED_EMAILS configured, so nobody can use the app yet. " +
+          "Add your email in Supabase \u2192 Edge Functions \u2192 Secrets \u2192 ALLOWED_EMAILS.",
       },
       503,
     );
   }
-
-  const res = await fetch(`${supabaseUrl()}/auth/v1/user`, {
-    headers: { apikey: publicKey(), Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) return json({ error: "Your session has expired. Please sign in again." }, 401);
-  const email = String((await res.json())?.email ?? "").toLowerCase();
   if (!email || !allowed.includes(email)) {
-    return json({ error: "This account is not authorized to use this app." }, 403);
+    return json(
+      {
+        error:
+          `${email || "This account"} is not on the allowed list. Sign in with an allowed email, or add ` +
+          "this one to ALLOWED_EMAILS in Supabase \u2192 Edge Functions \u2192 Secrets.",
+      },
+      403,
+    );
   }
   return email;
 }
@@ -243,6 +298,12 @@ export async function handler(req: Request): Promise<Response> {
           allowedEmails: list("ALLOWED_EMAILS", []).length > 0,
         },
       });
+    }
+
+    if (route === "me" && req.method === "GET") {
+      const who = await authorize(req);
+      if (who instanceof Response) return who;
+      return json({ email: who === SERVICE_CALLER ? null : who, service: who === SERVICE_CALLER });
     }
 
     if (route === "documents" && req.method === "GET") {

@@ -177,11 +177,13 @@ export default function Chat({ session }: { session: Session }) {
   }
 
   return (
-    <div className="flex h-screen flex-col">
-      <header className="flex items-center justify-between gap-3 border-b border-neutral-200 bg-white px-5 py-3">
-        <div>
+    <div className="flex h-dvh flex-col">
+      <header className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-neutral-200 bg-white px-4 py-3 sm:px-5">
+        <div className="min-w-0">
           <h1 className="text-sm font-semibold">Research Fact Base</h1>
-          <p className="text-xs text-neutral-500">Answers from your documents only — every citation checked</p>
+          <p className="hidden text-xs text-neutral-500 sm:block">
+            Answers from your documents only — every citation checked
+          </p>
         </div>
         <div className="flex items-center gap-3">
           <TierToggle tier={tier} setTier={setTier} disabled={busy} />
@@ -220,7 +222,7 @@ export default function Chat({ session }: { session: Session }) {
               }
             }}
             rows={1}
-            placeholder="Ask a question about your documents…"
+            placeholder="Ask about your documents…"
             className="max-h-40 flex-1 resize-none rounded-xl border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500"
           />
           <button

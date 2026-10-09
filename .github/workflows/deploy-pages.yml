@@ -30,6 +30,12 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Public by design (see src/lib/supabase.ts) — not secrets.
+      NEXT_PUBLIC_SUPABASE_URL: https://zfzydmozafepouflrlxb.supabase.co
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: sb_publishable_d7HEcptiQQyJPtkWUNBTYA_Xur1u94m
+      NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+      NEXT_PUBLIC_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -39,14 +45,24 @@ jobs:
       - run: npm ci
       - name: Test edge function (grounding checks, auth, pipeline)
         run: npm run test:edge
+      - name: Type-check
+        run: npm run test:types
       - name: Build static site
         run: npm run build
-        env:
-          # Public by design (see src/lib/supabase.ts) — not secrets.
-          NEXT_PUBLIC_SUPABASE_URL: https://zfzydmozafepouflrlxb.supabase.co
-          NEXT_PUBLIC_SUPABASE_ANON_KEY: sb_publishable_d7HEcptiQQyJPtkWUNBTYA_Xur1u94m
-          NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
-          NEXT_PUBLIC_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+      # Nothing is published unless these pass: the built site in a real browser
+      # (desktop + phone), talking to the real edge function code, with only
+      # Supabase Auth, the database and the AI services simulated.
+      - name: Browser tests
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test
+      - name: Keep browser test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report
+          retention-days: 7
       - uses: actions/upload-pages-artifact@v3
         with:
           path: out

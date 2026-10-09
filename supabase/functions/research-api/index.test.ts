@@ -41,17 +41,22 @@ interface Scenario {
   checkerFailsFirst?: boolean;
 }
 let scenario: Scenario = {};
-let calls: { url: string; body?: unknown }[] = [];
+let calls: { url: string; body?: unknown; headers: Record<string, string> }[] = [];
 
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input);
   const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-  calls.push({ url, body });
+  const headers = (init?.headers ?? {}) as Record<string, string>;
+  calls.push({ url, body, headers });
   const reply = (data: unknown, status = 200, headers: Record<string, string> = {}) =>
     new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...headers } });
 
   if (url.endsWith("/auth/v1/user")) {
     return scenario.user ? reply(scenario.user) : reply({ msg: "bad jwt" }, 401);
+  }
+  if (url.includes("/auth/v1/admin/users")) {
+    // Auth's admin API accepts only the project's real service keys.
+    return headers.apikey === "sb_secret_from_github" ? reply({ users: [] }) : reply({ msg: "not admin" }, 401);
   }
   if (url.includes(":embedContent")) {
     return reply({ embedding: { values: Array.from({ length: 1024 }, (_, i) => (i % 7) / 7) } });
@@ -83,6 +88,13 @@ async function events(res: Response): Promise<Record<string, unknown>[]> {
   const text = await res.text();
   return text.split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.type !== "ping");
 }
+
+const get = (route: string, token = "user-jwt") =>
+  handler(
+    new Request(`https://proj.supabase.co/functions/v1/research-api/${route}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    }),
+  );
 
 const chat = (body: unknown, token = "user-jwt") =>
   handler(
@@ -121,6 +133,57 @@ test("rejects signed-in users who are not on the allowlist", async () => {
   scenario.user = { email: "stranger@example.com" };
   const res = await chat({ messages: [{ role: "user", content: "q" }] });
   assert.equal(res.status, 403);
+});
+
+test("/me confirms an allowlisted user (email matched case-insensitively)", async () => {
+  scenario.user = { email: "OWNER@example.com" };
+  const res = await get("me");
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { email: "owner@example.com", service: false });
+});
+
+test("/me tells a signed-in stranger which account is not allowed", async () => {
+  scenario.user = { email: "stranger@example.com" };
+  const res = await get("me");
+  assert.equal(res.status, 403);
+  assert.match((await res.json()).error, /stranger@example\.com is not on the allowed list/);
+});
+
+test("/me rejects missing and expired sessions with 401", async () => {
+  assert.equal((await get("me", "")).status, 401);
+  scenario.user = null;
+  const res = await get("me", "eyJexpired");
+  assert.equal(res.status, 401);
+  assert.match((await res.json()).error, /sign in again/);
+});
+
+test("the injected service key is accepted without calling Auth (smoke test caller)", async () => {
+  scenario.user = null;
+  const res = await get("me", "eyJservice");
+  assert.deepEqual(await res.json(), { email: null, service: true });
+  assert.equal(calls.filter((c) => c.url.includes("/auth/v1/")).length, 0);
+});
+
+test("a new-format secret key listed in SUPABASE_SECRET_KEYS is accepted", async () => {
+  scenario.user = null;
+  ENV.SUPABASE_SECRET_KEYS = JSON.stringify({ default: "sb_secret_abc" });
+  assert.equal((await get("me", "sb_secret_abc")).status, 200);
+});
+
+test("a service key not injected into the function is verified with Auth's admin API", async () => {
+  scenario.user = null;
+  const ok = await get("me", "sb_secret_from_github");
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json()).service, true);
+  const forged = await get("me", "sb_secret_forged");
+  assert.equal(forged.status, 401);
+});
+
+test("the service key can run the full pipeline even before ALLOWED_EMAILS is set", async () => {
+  delete ENV.ALLOWED_EMAILS;
+  scenario.user = null;
+  const evs = await events(await chat({ messages: [{ role: "user", content: "duty of good faith?" }] }, "eyJservice"));
+  assert.ok(evs.some((e) => e.type === "final"));
 });
 
 test("fails closed when ALLOWED_EMAILS is not configured", async () => {

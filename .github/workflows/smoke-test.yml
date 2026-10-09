@@ -1,0 +1,44 @@
+name: Live smoke test
+
+# Checks the deployed app for real: the GitHub Pages site, Supabase Auth and
+# the research-api edge function (scripts/smoke.mjs). Sends no email and
+# changes no data. The results table appears on the run's Summary page.
+#
+# Runs after every successful site deploy (quick checks only) and on demand via
+# "Run workflow" — which also asks real questions end to end (a few free
+# OpenRouter requests).
+
+on:
+  workflow_run:
+    workflows: ["Deploy site to GitHub Pages"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      ask:
+        description: "Also ask real questions end to end"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check the live site and backend
+        run: node scripts/smoke.mjs
+        env:
+          SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+          # Public by design (see src/lib/supabase.ts) — not secrets.
+          SUPABASE_URL: https://zfzydmozafepouflrlxb.supabase.co
+          SUPABASE_PUBLISHABLE_KEY: sb_publishable_d7HEcptiQQyJPtkWUNBTYA_Xur1u94m
+          # Already stored for the ingest job; lets the test act as a trusted caller.
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ASK: ${{ github.event_name == 'workflow_dispatch' && inputs.ask && '1' || '' }}

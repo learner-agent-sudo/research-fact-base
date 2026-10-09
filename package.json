@@ -7,7 +7,9 @@
     "build": "next build",
     "ingest": "node scripts/ingest.mjs",
     "typecheck": "tsc --noEmit",
-    "test:edge": "node --experimental-strip-types --no-warnings --test supabase/functions/research-api/*.test.ts"
+    "test:edge": "node --experimental-strip-types --no-warnings --test supabase/functions/research-api/*.test.ts",
+    "test:e2e": "playwright test",
+    "test:types": "tsc --noEmit && tsc --noEmit -p e2e"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
@@ -21,6 +23,7 @@
     "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.56.1",
     "@tailwindcss/postcss": "^4.0.0",
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.7",

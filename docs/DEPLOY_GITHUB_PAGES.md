@@ -40,9 +40,19 @@ automatically — don't add them.
 Supabase → **Authentication** → **URL Configuration**:
 
 - **Site URL:** `https://learner-agent-sudo.github.io/research-fact-base/`
-- **Redirect URLs** → add the same URL.
+- **Redirect URLs** → add `https://learner-agent-sudo.github.io/research-fact-base/**`
 
-Without this, the sign-in email links back to `localhost` and login fails.
+Without this, the sign-in email links back to `localhost:3000` and login fails.
+
+**Optional — sign in with a code too.** Handy when you read email on your
+phone but use the app on a computer. Supabase → **Authentication** →
+**Emails** → **Magic Link** template → add this line, then **Save**:
+
+```html
+<p>Or enter this code: <strong>{{ .Token }}</strong></p>
+```
+
+The sign-in page has a box for the code.
 
 ### 3. Turn on GitHub Pages
 GitHub → repo **Settings** → **Pages** → **Build and deployment** →
@@ -62,9 +72,28 @@ creating empty accounts.
 
 ## Checking it's healthy
 
+GitHub → **Actions** → **Live smoke test** → **Run workflow**. It checks the
+live site, sign-in service and API (secrets set, corpus loaded, strangers
+refused) and asks two real questions, then shows a table of results on the
+run's **Summary** page. It sends no email and changes no data. A quick version
+runs automatically after every publish.
+
 `https://zfzydmozafepouflrlxb.supabase.co/functions/v1/research-api/health`
 returns which secrets are set (true/false only), e.g.
 `{"ok":true,"configured":{"supabase":true,"openrouter":true,"gemini":true,"allowedEmails":true}}`.
+
+## Sign-in troubleshooting
+
+| What you see | Cause | Fix |
+|---|---|---|
+| The email link opens `localhost:3000` | Site URL not set | Step 2 above, then request a **new** link |
+| "link is invalid or has expired" | Each link works once, and only the newest email's link works | Request a new link and click it once |
+| "Too many sign-in emails" | Supabase's free email service sends only a few per hour | Use the newest email you have, or wait |
+| "…is not on the allowed list" | The email you signed in with isn't in `ALLOWED_EMAILS` | Add it (step 1) and press **Try again** |
+
+The link signs you in on the device where you open it. To use the app on a
+computer while reading email on a phone, open the email on the computer, or
+use the code (optional part of step 2).
 
 ## Updating the backend
 
