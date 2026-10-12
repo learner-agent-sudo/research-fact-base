@@ -44,15 +44,10 @@ Supabase → **Authentication** → **URL Configuration**:
 
 Without this, the sign-in email links back to `localhost:3000` and login fails.
 
-**Optional — sign in with a code too.** Handy when you read email on your
-phone but use the app on a computer. Supabase → **Authentication** →
-**Emails** → **Magic Link** template → add this line, then **Save**:
-
-```html
-<p>Or enter this code: <strong>{{ .Token }}</strong></p>
-```
-
-The sign-in page has a box for the code.
+**Sign-in codes (needs your own email service).** Supabase only lets you
+edit email templates once custom SMTP is set up (Authentication → Emails →
+SMTP Settings). If you do that, add `<p>Or enter this code: <strong>{{ .Token }}</strong></p>`
+to the **Magic Link** template, and the code box on the sign-in page will work.
 
 ### 3. Turn on GitHub Pages
 GitHub → repo **Settings** → **Pages** → **Build and deployment** →
@@ -93,7 +88,7 @@ returns which secrets are set (true/false only), e.g.
 
 The link signs you in on the device where you open it. To use the app on a
 computer while reading email on a phone, open the email on the computer, or
-use the code (optional part of step 2).
+use a sign-in code (needs custom SMTP, see step 2).
 
 ## Updating the backend
 
@@ -117,8 +112,12 @@ reject the browser's CORS preflight requests.
 | `RETRIEVAL_TOP_K` | `8` | passages searched per question |
 | `MIN_SIMILARITY` | `0` (off) | drop weak matches; the app abstains if none remain |
 
-Free OpenRouter models change often. If answers fail with a model error, check
-<https://openrouter.ai/models?max_price=0> and update `FREE_*`. Note that free
+Free OpenRouter models change often, so the function checks OpenRouter's live
+model list (cached for an hour): configured models that are still free are
+used first, and any that have been withdrawn are replaced by the best models
+that are free right now. The paid tier likewise falls back to the newest
+Claude Sonnet if a configured slug disappears. Set `FREE_*` only to change
+the preference order. Note that free
 OpenRouter accounts have a small daily request cap, and each question uses
 `FANOUT + 1` requests.
 

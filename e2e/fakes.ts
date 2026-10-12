@@ -207,6 +207,9 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
   if (url === `${SUPABASE_URL}/rest/v1/rpc/match_chunks`) return reply(world.rows);
   if (url.startsWith(`${SUPABASE_URL}/rest/v1/documents`)) return reply(DOCS);
   if (url.startsWith(`${SUPABASE_URL}/rest/v1/chunks`)) return reply([{ id: "c1" }], 200, { "content-range": "0-0/1234" });
+  // Model list unavailable: the function falls back to its configured models
+  // (model selection itself is covered by the edge function's unit tests).
+  if (url === "https://openrouter.ai/api/v1/models") return reply({ error: "unavailable" }, 503);
   if (url === "https://openrouter.ai/api/v1/chat/completions") {
     const { model, messages } = body as { model: string; messages: { content: string }[] };
     world.modelCalls.push(model);

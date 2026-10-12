@@ -39,6 +39,8 @@ interface Scenario {
   user?: { email: string } | null;
   rows?: unknown[];
   checkerFailsFirst?: boolean;
+  /** OpenRouter's model list; unset = the list can't be fetched. */
+  catalog?: { id: string; created?: number; context_length?: number; pricing?: { prompt: string; completion: string } }[];
 }
 let scenario: Scenario = {};
 let calls: { url: string; body?: unknown; headers: Record<string, string> }[] = [];
@@ -66,12 +68,15 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     return reply([{ id: "d1", title: "Contract Case List 2024.md", mime_type: "text/markdown", status: "ready" }]);
   }
   if (url.includes("/rest/v1/chunks")) return reply([{ id: "c1" }], 200, { "content-range": "0-0/999" });
+  if (url === "https://openrouter.ai/api/v1/models") {
+    return scenario.catalog ? reply({ data: scenario.catalog }) : reply({ error: "unavailable" }, 503);
+  }
   if (url.includes("openrouter.ai")) {
     const system = (body as { messages: { content: string }[] }).messages[0].content;
     const isChecker = system.startsWith("You are a strict verifier");
     if (isChecker) {
       const priorCheckerCalls = calls.filter(
-        (c) => c.url.includes("openrouter.ai") &&
+        (c) => c.url.endsWith("/chat/completions") &&
           (c.body as { messages: { content: string }[] }).messages[0].content.startsWith("You are a strict verifier"),
       ).length;
       if (scenario.checkerFailsFirst && priorCheckerCalls === 1) return reply({ error: "overloaded" }, 503);
@@ -83,6 +88,8 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
 }) as typeof fetch;
 
 const { handler } = await import("./index.ts");
+const { clearModelCatalog } = await import("./pipeline.ts");
+const completions = () => calls.filter((c) => c.url.endsWith("/chat/completions"));
 
 async function events(res: Response): Promise<Record<string, unknown>[]> {
   const text = await res.text();
@@ -106,6 +113,7 @@ const chat = (body: unknown, token = "user-jwt") =>
   );
 
 beforeEach(() => {
+  clearModelCatalog();
   resetEnv();
   scenario = { user: { email: "owner@example.com" } };
   calls = [];
@@ -213,7 +221,7 @@ test("full pipeline: grounded answer, fabricated citation removed before sending
   // No unverified text was ever streamed: the only answer text is in "final".
   assert.ok(!evs.some((e) => e.type === "delta"));
   // Three generators + one checker call.
-  assert.equal(calls.filter((c) => c.url.includes("openrouter.ai")).length, 4);
+  assert.equal(completions().length, 4);
   // Service role key used for the vector search, sent to Supabase only.
   const search = calls.find((c) => c.url.endsWith("/rpc/match_chunks"))!;
   assert.equal((search.body as { match_count: number }).match_count, 8);
@@ -224,7 +232,7 @@ test("abstains without calling any model when nothing relevant is retrieved", as
   const evs = await events(await chat({ messages: [{ role: "user", content: "Unrelated?" }] }));
   const final = evs.find((e) => e.type === "final") as { text: string };
   assert.match(final.text, /don't contain anything relevant/);
-  assert.equal(calls.filter((c) => c.url.includes("openrouter.ai")).length, 0);
+  assert.equal(completions().length, 0);
 });
 
 test("missing model key is reported plainly, not as 'no information found'", async () => {
@@ -239,6 +247,66 @@ test("checker falls back to the next model when the first is unavailable", async
   const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
   const final = evs.find((e) => e.type === "final") as { checker: string };
   assert.equal(final.checker, "deepseek/deepseek-chat-v3-0324:free");
+});
+
+const FREE = { prompt: "0", completion: "0" };
+const PAID = { prompt: "0.000003", completion: "0.000015" };
+
+test("free tier switches to models that are still free when configured ones are withdrawn", async () => {
+  scenario.catalog = [
+    // Configured slugs, no longer free (the live failure this guards against).
+    { id: "meta-llama/llama-3.3-70b-instruct", pricing: PAID, context_length: 131072 },
+    { id: "deepseek/deepseek-chat-v3-0324", pricing: PAID, context_length: 163840 },
+    { id: "openai/gpt-oss-120b:free", pricing: FREE, context_length: 131072, created: 5 },
+    { id: "google/gemini-2.0-flash-exp:free", pricing: FREE, context_length: 1048576, created: 3 },
+    { id: "qwen/qwen3-235b-a22b:free", pricing: FREE, context_length: 131072, created: 4 },
+    { id: "deepseek/deepseek-chat-v3.1:free", pricing: FREE, context_length: 163840, created: 6 },
+    // Skipped: too small, not a chat model, too little context.
+    { id: "meta-llama/llama-3.2-3b-instruct:free", pricing: FREE, context_length: 131072, created: 9 },
+    { id: "qwen/qwen2.5-vl-72b-instruct:free", pricing: FREE, context_length: 131072, created: 9 },
+    { id: "mistralai/mistral-small:free", pricing: FREE, context_length: 8192, created: 9 },
+  ];
+  const evs = await events(await chat({ messages: [{ role: "user", content: "duty of good faith?" }] }));
+  const meta = evs.find((e) => e.type === "meta") as { generators: string[]; checker: string };
+  assert.deepEqual(meta.generators, [
+    "deepseek/deepseek-chat-v3.1:free",
+    "qwen/qwen3-235b-a22b:free",
+    "google/gemini-2.0-flash-exp:free",
+  ]);
+  assert.equal(meta.checker, "deepseek/deepseek-chat-v3.1:free");
+  assert.ok(evs.some((e) => e.type === "final"));
+  const used = completions().map((c) => (c.body as { model: string }).model);
+  assert.ok(used.every((m) => m.endsWith(":free")), `only free models called: ${used}`);
+});
+
+test("configured free models that are still free keep their place", async () => {
+  scenario.catalog = [
+    { id: "qwen/qwen-2.5-72b-instruct:free", pricing: FREE, context_length: 32768 },
+    { id: "deepseek/deepseek-chat-v3.1:free", pricing: FREE, context_length: 163840 },
+  ];
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const meta = evs.find((e) => e.type === "meta") as { generators: string[] };
+  assert.deepEqual(meta.generators, ["qwen/qwen-2.5-72b-instruct:free", "deepseek/deepseek-chat-v3.1:free"]);
+});
+
+test("paid tier falls back to the newest Claude Sonnet and still drafts with one model", async () => {
+  scenario.catalog = [
+    { id: "anthropic/claude-sonnet-4", pricing: PAID, created: 1 },
+    { id: "anthropic/claude-sonnet-4.6", pricing: PAID, created: 3 },
+    { id: "anthropic/claude-opus-4.6", pricing: PAID, created: 4 },
+  ];
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }], tier: "paid" }));
+  const meta = evs.find((e) => e.type === "meta") as { generators: string[]; checker: string };
+  // The configured drafting model (sonnet-4.5) is gone: newest Sonnet, still just one.
+  assert.deepEqual(meta.generators, ["anthropic/claude-sonnet-4.6"]);
+  // The checker list's own fallback (sonnet-4) is still offered, so it's kept first.
+  assert.equal(meta.checker, "anthropic/claude-sonnet-4");
+});
+
+test("uses the configured models as-is when OpenRouter's model list is unavailable", async () => {
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const meta = evs.find((e) => e.type === "meta") as { generators: string[] };
+  assert.equal(meta.generators[0], "meta-llama/llama-3.3-70b-instruct:free");
 });
 
 test("documents route returns corpus status", async () => {

@@ -214,6 +214,91 @@ export async function retrieve(cfg: Config, query: string, signal?: AbortSignal)
 
 type Msg = { role: string; content: string };
 
+interface CatalogModel {
+  id: string;
+  created?: number;
+  context_length?: number;
+  pricing?: { prompt?: string; completion?: string };
+}
+
+const CATALOG_TTL_MS = 60 * 60 * 1000;
+let catalog: { at: number; models: CatalogModel[] } | null = null;
+
+/** Forget the cached OpenRouter model list (tests). */
+export function clearModelCatalog() {
+  catalog = null;
+}
+
+/** OpenRouter's public model list, cached for an hour; null if it can't be fetched. */
+async function modelCatalog(cfg: Config, signal?: AbortSignal): Promise<CatalogModel[] | null> {
+  if (catalog && Date.now() - catalog.at < CATALOG_TTL_MS) return catalog.models;
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/models", {
+      headers: { Authorization: `Bearer ${cfg.openrouterKey}` },
+      signal: withTimeout(signal, 10_000),
+    });
+    const data = res.ok ? (await res.json())?.data : null;
+    if (!res.ok) await res.body?.cancel();
+    if (!Array.isArray(data) || !data.length) return catalog?.models ?? null;
+    catalog = { at: Date.now(), models: data as CatalogModel[] };
+    return catalog.models;
+  } catch {
+    return catalog?.models ?? null;
+  }
+}
+
+const isFree = (m: CatalogModel) =>
+  m.id.endsWith(":free") ||
+  (m.pricing?.prompt !== undefined && Number(m.pricing.prompt) === 0 && Number(m.pricing.completion) === 0);
+
+// Free models to fall back on when the configured ones stop being free, best
+// families first. Small (<10B) and non-chat models are skipped.
+const FREE_FAMILIES = [/deepseek/, /qwen/, /llama-(4|3\.3)/, /gemini|gemma-3-27b/, /gpt-oss/, /kimi|glm|mistral/];
+const TOO_SMALL = /[-_:/](0\.\d+|1|1\.5|2|3|4|7|8|9)b\b/i;
+const NOT_CHAT = /[-_]vl\b|vision|embed|guard|audio|tts|image/i;
+
+function rankedFree(models: CatalogModel[]): string[] {
+  const family = (id: string) => {
+    const i = FREE_FAMILIES.findIndex((re) => re.test(id));
+    return i === -1 ? FREE_FAMILIES.length : i;
+  };
+  return models
+    .filter((m) => isFree(m) && (m.context_length ?? 0) >= 16_000 && !TOO_SMALL.test(m.id) && !NOT_CHAT.test(m.id))
+    .sort((a, b) => family(a.id) - family(b.id) || (b.created ?? 0) - (a.created ?? 0))
+    .map((m) => m.id);
+}
+
+const unique = (ids: string[]) => [...new Set(ids)];
+
+/**
+ * The models to use for a tier, checked against OpenRouter's live list:
+ * configured models that are still offered (and, for the free tier, still
+ * free) come first, then the best other candidates. Free slugs come and go,
+ * so this keeps the app answering without a redeploy. If the list can't be
+ * fetched, the configured models are used as-is.
+ */
+export async function resolveModels(cfg: Config, tier: Tier, signal?: AbortSignal): Promise<ModelSet> {
+  const configured = cfg.models[tier];
+  const models = await modelCatalog(cfg, signal);
+  if (!models) return configured;
+
+  const offered = new Set(models.filter((m) => (tier === "free" ? isFree(m) : !isFree(m))).map((m) => m.id));
+  const fallbacks =
+    tier === "free"
+      ? rankedFree(models)
+      : models
+        .filter((m) => /^anthropic\/claude-[\w.-]*sonnet/.test(m.id) && !isFree(m))
+        .sort((a, b) => (b.created ?? 0) - (a.created ?? 0))
+        .map((m) => m.id);
+  const pick = (ids: string[]) => unique([...ids.filter((id) => offered.has(id)), ...fallbacks]);
+
+  // Never more drafting models than configured (the paid tier drafts with one).
+  const generators = pick(configured.generators).slice(0, Math.max(1, configured.generators.length));
+  const checker = pick(configured.checker).slice(0, 4);
+  if (!generators.length || !checker.length) return configured;
+  return { generators, checker };
+}
+
 export async function chatComplete(
   cfg: Config,
   model: string,
@@ -421,7 +506,7 @@ export async function runPipeline(
     return;
   }
 
-  const set = cfg.models[tier];
+  const set = await resolveModels(cfg, tier, signal);
   const generators = set.generators.slice(0, Math.max(1, cfg.fanout));
   emit({ type: "meta", tier, generators, checker: set.checker[0] ?? "" });
 
