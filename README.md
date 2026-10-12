@@ -41,14 +41,17 @@ answers signed-in users whose email is on the `ALLOWED_EMAILS` list.
 ## Layout
 
 ```
-src/app/                         pages: chat (/) and corpus status (/admin)
+src/app/                         pages: Ask (/), Documents (/documents), Settings (/settings)
 src/components/AuthGate.tsx      email sign-in (link or code) + access check
 src/components/Chat.tsx          chat UI + source-check panels
 src/lib/supabase.ts              Supabase client + API helper
+src/lib/chatStore.ts             the conversation (kept across pages, saved in the browser)
+src/lib/theme.ts                 light / dark / match-device appearance
 supabase/functions/research-api/ the backend
   index.ts                         HTTP routes, auth, streaming
   pipeline.ts                      retrieval, model ensemble, checker
   grounding.ts                     deterministic citation / quote checks
+  settings.ts                      Settings-page options and API keys (Supabase Vault)
   *.test.ts                        tests (npm run test:edge)
 supabase/migrations/             database schema
 scripts/ingest.mjs               Drive → embeddings loader (GitHub Actions)

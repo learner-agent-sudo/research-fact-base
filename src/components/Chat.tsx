@@ -1,55 +1,23 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { Session } from "@supabase/supabase-js";
-import { api, errorMessage, supabase } from "@/lib/supabase";
-
-type Tier = "free" | "paid";
-type Confidence = "high" | "medium" | "low";
-type Stage = "retrieving" | "drafting" | "checking" | "verifying";
-
-interface Source {
-  id: string;
-  title: string;
-  url?: string;
-  snippet: string;
-  similarity?: number;
-}
-interface CitationCheck {
-  text: string;
-  kind: string;
-  grounded: boolean;
-}
-interface QuoteCheck {
-  source: string;
-  text: string;
-  status: "verified" | "misattributed" | "not_found";
-  foundIn?: string;
-}
-interface Removal {
-  sentence: string;
-  reason: string;
-}
-
-interface Msg {
-  role: "user" | "assistant";
-  content: string;
-  stage?: Stage;
-  sources?: Source[];
-  generators?: string[];
-  checker?: string;
-  tier?: Tier;
-  citations?: CitationCheck[];
-  quotes?: QuoteCheck[];
-  removed?: Removal[];
-  confidence?: Confidence;
-  unsupported?: string[];
-  pending?: boolean;
-  error?: string;
-}
+import AppHeader from "@/components/AppHeader";
+import {
+  ask,
+  chooseTier,
+  newConversation,
+  rerunWithPaid,
+  useChat,
+  type CitationCheck,
+  type Confidence,
+  type Msg,
+  type QuoteCheck,
+  type Removal,
+  type Source,
+  type Tier,
+} from "@/lib/chatStore";
 
 const CONF_STYLE: Record<Confidence, string> = {
   high: "bg-green-100 text-green-800 border-green-200",
@@ -70,142 +38,41 @@ function stageLabel(m: Msg): string {
   }
 }
 
-export default function Chat({ session }: { session: Session }) {
-  const [messages, setMessages] = useState<Msg[]>([]);
+export default function Chat() {
+  const { messages, tier, busy } = useChat();
   const [input, setInput] = useState("");
-  const [tier, setTier] = useState<Tier>("free");
-  const [busy, setBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
-  function patchLast(patch: Partial<Msg>) {
-    setMessages((prev) => {
-      const copy = [...prev];
-      copy[copy.length - 1] = { ...copy[copy.length - 1], ...patch };
-      return copy;
-    });
-  }
-
-  async function run(history: { role: string; content: string }[], useTier: Tier) {
-    setMessages((prev) => [...prev, { role: "assistant", content: "", pending: true, tier: useTier }]);
-    setBusy(true);
-    try {
-      const res = await api("/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history, tier: useTier }),
-      });
-      if (!res.ok || !res.body) throw new Error(await errorMessage(res));
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          let ev: Record<string, unknown>;
-          try {
-            ev = JSON.parse(line);
-          } catch {
-            continue;
-          }
-          switch (ev.type) {
-            case "stage":
-              patchLast({ stage: ev.stage as Stage });
-              break;
-            case "sources":
-              patchLast({ sources: ev.sources as Source[] });
-              break;
-            case "meta":
-              patchLast({ generators: ev.generators as string[], checker: ev.checker as string, tier: ev.tier as Tier });
-              break;
-            case "final":
-              patchLast({
-                content: ev.text as string,
-                removed: ev.removed as Removal[],
-                citations: ev.citations as CitationCheck[],
-                quotes: ev.quotes as QuoteCheck[],
-                checker: (ev.checker as string) || undefined,
-              });
-              break;
-            case "done":
-              patchLast({ confidence: ev.confidence as Confidence, unsupported: ev.unsupported as string[], pending: false });
-              break;
-            case "error":
-              patchLast({ error: ev.message as string, pending: false });
-              break;
-          }
-        }
-      }
-      patchLast({ pending: false });
-    } catch (e) {
-      patchLast({ error: e instanceof Error ? e.message : String(e), pending: false });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  /** Prior turns sent as context: only completed, verified answers. */
-  function historyUpTo(list: Msg[]) {
-    return list
-      .filter((m) => m.content && !m.error && !m.pending)
-      .map((m) => ({ role: m.role, content: m.content }));
-  }
-
   function onSubmit(e: FormEvent) {
     e.preventDefault();
-    const q = input.trim();
-    if (!q || busy) return;
+    if (!input.trim() || busy) return;
+    ask(input);
     setInput("");
-    const history = [...historyUpTo(messages), { role: "user", content: q }];
-    setMessages((prev) => [...prev, { role: "user", content: q }]);
-    run(history, tier);
-  }
-
-  function rerunWithClaude() {
-    const lastUser = messages.map((m) => m.role).lastIndexOf("user");
-    if (lastUser < 0 || busy) return;
-    run(historyUpTo(messages.slice(0, lastUser + 1)), "paid");
   }
 
   return (
     <div className="flex h-dvh flex-col">
-      <header className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-neutral-200 bg-white px-4 py-3 sm:px-5">
-        <div className="min-w-0">
-          <h1 className="text-sm font-semibold">Research Fact Base</h1>
-          <p className="hidden text-xs text-neutral-500 sm:block">
-            Answers from your documents only — every citation checked
-          </p>
-        </div>
-        <div className="flex items-center gap-3">
-          <TierToggle tier={tier} setTier={setTier} disabled={busy} />
-          <Link href="/admin/" className="text-xs text-neutral-600 underline">
-            Corpus
-          </Link>
-          <button
-            onClick={() => supabase?.auth.signOut()}
-            className="text-xs text-neutral-500 underline"
-            title={session.user.email ?? ""}
-          >
-            Sign out
-          </button>
-        </div>
-      </header>
+      <AppHeader active="ask">
+        <TierToggle tier={tier} disabled={busy} />
+        <button
+          onClick={newConversation}
+          disabled={busy || messages.length === 0}
+          className="rounded-lg border border-neutral-200 px-2.5 py-1 text-xs text-neutral-600 disabled:opacity-40"
+        >
+          New conversation
+        </button>
+      </AppHeader>
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl px-4 py-6">
           {messages.length === 0 ? (
             <EmptyState />
           ) : (
-            messages.map((m, i) => <Bubble key={i} m={m} onEscalate={rerunWithClaude} busy={busy} />)
+            messages.map((m, i) => <Bubble key={i} m={m} onEscalate={rerunWithPaid} busy={busy} />)
           )}
         </div>
       </div>
@@ -223,7 +90,7 @@ export default function Chat({ session }: { session: Session }) {
             }}
             rows={1}
             placeholder="Ask about your documents…"
-            className="max-h-40 flex-1 resize-none rounded-xl border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-neutral-500"
+            className="max-h-40 flex-1 resize-none rounded-xl border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:border-neutral-500"
           />
           <button
             type="submit"
@@ -239,19 +106,25 @@ export default function Chat({ session }: { session: Session }) {
   );
 }
 
-function TierToggle({ tier, setTier, disabled }: { tier: Tier; setTier: (t: Tier) => void; disabled: boolean }) {
+function TierToggle({ tier, disabled }: { tier: Tier; disabled: boolean }) {
+  const label: Record<Tier, [string, string]> = {
+    free: ["Free", "Several free AI models draft and cross-check each answer"],
+    paid: ["Paid", "Your chosen paid model (billed to your OpenRouter account)"],
+  };
   return (
-    <div className="flex items-center gap-1 rounded-lg border border-neutral-200 bg-neutral-50 p-0.5 text-xs">
+    <div role="group" aria-label="Answer mode" className="flex items-center gap-1 rounded-lg border border-neutral-200 bg-neutral-50 p-0.5 text-xs">
       {(["free", "paid"] as Tier[]).map((t) => (
         <button
           key={t}
-          onClick={() => setTier(t)}
+          onClick={() => chooseTier(t)}
           disabled={disabled}
+          aria-pressed={tier === t}
+          title={label[t][1]}
           className={`rounded-md px-2.5 py-1 font-medium transition ${
             tier === t ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-500"
           } disabled:opacity-50`}
         >
-          {t === "free" ? "Free (ensemble)" : "Claude (paid)"}
+          {label[t][0]}
         </button>
       ))}
     </div>
@@ -330,7 +203,7 @@ function Bubble({ m, onEscalate, busy }: { m: Msg; onEscalate: () => void; busy:
               disabled={busy}
               className="ml-1 rounded-full border border-neutral-300 bg-white px-2 py-0.5 font-medium text-neutral-700 hover:bg-neutral-100 disabled:opacity-50"
             >
-              ↑ Re-run with Claude (paid)
+              ↑ Re-run with the paid model
             </button>
           )}
         </div>

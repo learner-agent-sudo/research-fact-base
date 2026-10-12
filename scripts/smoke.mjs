@@ -82,9 +82,12 @@ await check("Site: home page loads", async () => {
   return `${assets.length} script/style files all load`;
 });
 
-await check("Site: corpus page loads", async () => {
-  const { res } = await get(`${SITE}admin/`);
-  assert(res.status === 200, `HTTP ${res.status}`);
+await check("Site: Documents and Settings pages load", async () => {
+  for (const page of ["documents/", "settings/"]) {
+    const { res, text } = await get(`${SITE}${page}`);
+    assert(res.status === 200, `${page} → HTTP ${res.status}`);
+    assert(/<title>[^<]*Research Fact Base/.test(text), `${page} isn't the app`);
+  }
 });
 
 // --- 2. Supabase Auth ---------------------------------------------------------
@@ -153,6 +156,20 @@ if (!SERVICE_KEY) {
     const by = documents.reduce((a, d) => ((a[d.status] = (a[d.status] ?? 0) + 1), a), {});
     assert(by.ready > 0 && embeddedChunks > 0, "no documents are ready to search yet");
     return `${by.ready ?? 0} ready, ${by.ingesting ?? 0} still loading, ${by.error ?? 0} skipped; ${embeddedChunks} passages`;
+  });
+
+  await check("API: Settings page data loads, without exposing keys", async () => {
+    const { res, text } = await get(`${FN}/settings`, { headers: fnHeaders(SERVICE_KEY) });
+    assert(res.status === 200, `HTTP ${res.status}: ${text.slice(0, 200)}`);
+    const data = JSON.parse(text);
+    for (const name of ["openrouter", "gemini"]) {
+      const k = data.keys?.[name];
+      assert(k && k.source !== "missing", `${name} key is not set`);
+      assert(!k.hint || /^\u2022{4}/.test(k.hint), `${name} key hint looks unmasked`);
+    }
+    const free = data.models?.current?.free;
+    assert(free?.generators?.length, "no free models available");
+    return `answers drafted by ${free.generators.join(", ")}; checked by ${free.checker}`;
   });
 
   if (ASK) {

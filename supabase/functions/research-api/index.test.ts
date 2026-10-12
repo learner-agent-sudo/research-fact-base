@@ -43,6 +43,10 @@ interface Scenario {
   catalog?: { id: string; created?: number; context_length?: number; pricing?: { prompt: string; completion: string } }[];
 }
 let scenario: Scenario = {};
+/** Simulated database state: app_settings rows and Vault secrets. */
+let db: { appSettings: Record<string, unknown>; vault: Record<string, string> } = { appSettings: {}, vault: {} };
+const VALID_OR_KEY = "sk-or-v1-valid-key-1234567890";
+const BAD_GEMINI_KEY = "AIza-revoked-key-000000000";
 let calls: { url: string; body?: unknown; headers: Record<string, string> }[] = [];
 
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -59,6 +63,29 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
   if (url.includes("/auth/v1/admin/users")) {
     // Auth's admin API accepts only the project's real service keys.
     return headers.apikey === "sb_secret_from_github" ? reply({ users: [] }) : reply({ msg: "not admin" }, 401);
+  }
+  if (url.includes("/rest/v1/app_settings")) {
+    if (init?.method === "POST") {
+      const row = body as { key: string; value: unknown };
+      db.appSettings[row.key] = row.value;
+      return new Response(null, { status: 201 });
+    }
+    return reply(Object.entries(db.appSettings).map(([key, value]) => ({ key, value })));
+  }
+  if (url.endsWith("/rpc/app_secret_get")) {
+    return reply(db.vault[(body as { p_name: string }).p_name] ?? null);
+  }
+  if (url.endsWith("/rpc/app_secret_set")) {
+    const { p_name, p_value } = body as { p_name: string; p_value: string | null };
+    if (p_value) db.vault[p_name] = p_value;
+    else delete db.vault[p_name];
+    return new Response(null, { status: 204 });
+  }
+  if (url === "https://openrouter.ai/api/v1/key") {
+    return headers.Authorization === `Bearer ${VALID_OR_KEY}` ? reply({ data: {} }) : reply({ error: "No auth" }, 401);
+  }
+  if (url.includes(":embedContent") && headers["x-goog-api-key"] === BAD_GEMINI_KEY) {
+    return reply({ error: { message: "API key not valid. Please pass a valid API key.", status: "API_KEY_INVALID" } }, 400);
   }
   if (url.includes(":embedContent")) {
     return reply({ embedding: { values: Array.from({ length: 1024 }, (_, i) => (i % 7) / 7) } });
@@ -114,6 +141,7 @@ const chat = (body: unknown, token = "user-jwt") =>
 
 beforeEach(() => {
   clearModelCatalog();
+  db = { appSettings: {}, vault: {} };
   resetEnv();
   scenario = { user: { email: "owner@example.com" } };
   calls = [];
@@ -147,7 +175,7 @@ test("/me confirms an allowlisted user (email matched case-insensitively)", asyn
   scenario.user = { email: "OWNER@example.com" };
   const res = await get("me");
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { email: "owner@example.com", service: false });
+  assert.deepEqual(await res.json(), { email: "owner@example.com", service: false, defaultTier: "free" });
 });
 
 test("/me tells a signed-in stranger which account is not allowed", async () => {
@@ -168,8 +196,13 @@ test("/me rejects missing and expired sessions with 401", async () => {
 test("the injected service key is accepted without calling Auth (smoke test caller)", async () => {
   scenario.user = null;
   const res = await get("me", "eyJservice");
-  assert.deepEqual(await res.json(), { email: null, service: true });
+  assert.deepEqual(await res.json(), { email: null, service: true, defaultTier: "free" });
   assert.equal(calls.filter((c) => c.url.includes("/auth/v1/")).length, 0);
+});
+
+test("/me reports the default answer mode chosen on the Settings page", async () => {
+  db.appSettings.ai = { defaultTier: "paid" };
+  assert.equal((await (await get("me")).json()).defaultTier, "paid");
 });
 
 test("a new-format secret key listed in SUPABASE_SECRET_KEYS is accepted", async () => {
@@ -307,6 +340,145 @@ test("uses the configured models as-is when OpenRouter's model list is unavailab
   const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
   const meta = evs.find((e) => e.type === "meta") as { generators: string[] };
   assert.equal(meta.generators[0], "meta-llama/llama-3.3-70b-instruct:free");
+});
+
+// ---------------------------------------------------------------------------
+// Settings page
+// ---------------------------------------------------------------------------
+
+const put = (route: string, body: unknown, token = "user-jwt") =>
+  handler(
+    new Request(`https://proj.supabase.co/functions/v1/research-api/${route}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+
+test("CORS preflight allows PUT (the Settings page saves with PUT)", async () => {
+  const res = await handler(new Request("https://p/functions/v1/research-api/settings", { method: "OPTIONS" }));
+  assert.match(res.headers.get("access-control-allow-methods") ?? "", /PUT/);
+});
+
+test("settings: defaults, where each key comes from, and never the key itself", async () => {
+  const res = await get("settings");
+  assert.equal(res.status, 200);
+  const data = await res.json();
+  assert.deepEqual(data.ai, { defaultTier: "free", fanout: 3, topK: 8, freeModels: [], freeChecker: "", paidModel: "" });
+  assert.equal(data.keys.openrouter.source, "supabase");
+  assert.equal(data.keys.gemini.source, "supabase");
+  const text = JSON.stringify(data);
+  assert.ok(!text.includes("or-key") && !text.includes("gem-key"), "key values must never be returned");
+  assert.equal(data.models.current.free.generators.length, 3);
+});
+
+test("settings are only for allowlisted users", async () => {
+  assert.equal((await get("settings", "")).status, 401);
+  scenario.user = { email: "stranger@example.com" };
+  assert.equal((await get("settings")).status, 403);
+  assert.equal((await put("settings", { ai: { fanout: 1 } })).status, 403);
+  assert.equal((await put("settings/keys", { name: "openrouter", value: VALID_OR_KEY })).status, 403);
+  assert.deepEqual(db, { appSettings: {}, vault: {} });
+});
+
+test("settings reject out-of-range or malformed values", async () => {
+  for (const ai of [{ fanout: 5 }, { topK: 7 }, { defaultTier: "gold" }, { freeModels: ["not a model"] }, { paidModel: "x" }]) {
+    const res = await put("settings", { ai });
+    assert.equal(res.status, 400, JSON.stringify(ai));
+  }
+  assert.deepEqual(db.appSettings, {});
+});
+
+test("saved AI settings drive the next answer: models, drafting count and passages", async () => {
+  scenario.catalog = [
+    { id: "acme/chosen-model:free", pricing: FREE, context_length: 131072 },
+    { id: "acme/chosen-checker:free", pricing: FREE, context_length: 131072 },
+    { id: "deepseek/deepseek-chat-v3.1:free", pricing: FREE, context_length: 163840 },
+  ];
+  const saved = await put("settings", {
+    ai: { fanout: 2, topK: 6, freeModels: ["acme/chosen-model:free"], freeChecker: "acme/chosen-checker:free" },
+  });
+  assert.equal(saved.status, 200);
+  assert.equal((await saved.json()).ai.fanout, 2);
+  assert.equal((db.appSettings.ai as { topK: number }).topK, 6);
+
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const meta = evs.find((e) => e.type === "meta") as { generators: string[]; checker: string };
+  assert.deepEqual(meta.generators, ["acme/chosen-model:free", "deepseek/deepseek-chat-v3.1:free"]);
+  assert.equal(meta.checker, "acme/chosen-checker:free");
+  const search = calls.find((c) => c.url.endsWith("/rpc/match_chunks"))!;
+  assert.equal((search.body as { match_count: number }).match_count, 6);
+  assert.equal(completions().length, 3, "two drafts + one check");
+});
+
+test("a chosen paid model drafts and checks paid answers", async () => {
+  scenario.catalog = [{ id: "openai/gpt-5", pricing: PAID, context_length: 400000 }];
+  assert.equal((await put("settings", { ai: { paidModel: "openai/gpt-5" } })).status, 200);
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }], tier: "paid" }));
+  const meta = evs.find((e) => e.type === "meta") as { generators: string[]; checker: string };
+  assert.deepEqual(meta.generators, ["openai/gpt-5"]);
+  assert.equal(meta.checker, "openai/gpt-5");
+});
+
+test("a key that OpenRouter rejects is not saved", async () => {
+  const res = await put("settings/keys", { name: "openrouter", value: "sk-or-v1-wrong-key-0000000" });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /rejected this key/);
+  assert.deepEqual(db.vault, {});
+});
+
+test("a key that Google rejects is not saved", async () => {
+  const res = await put("settings/keys", { name: "gemini", value: BAD_GEMINI_KEY });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /Google rejected this key/);
+  assert.deepEqual(db.vault, {});
+});
+
+test("incomplete-looking keys are refused before contacting anyone", async () => {
+  for (const value of ["short", "sk-or-v1 with spaces in it", ""]) {
+    assert.equal((await put("settings/keys", { name: "openrouter", value })).status, 400);
+  }
+  assert.equal((await put("settings/keys", { name: "aws", value: VALID_OR_KEY })).status, 400);
+  assert.equal(calls.filter((c) => c.url.includes("/api/v1/key")).length, 0);
+});
+
+test("a key saved on the Settings page is used instead of the Supabase secret, and can be removed", async () => {
+  assert.equal((await put("settings/keys", { name: "openrouter", value: VALID_OR_KEY })).status, 200);
+  assert.equal(db.vault.rfb_openrouter_api_key, VALID_OR_KEY);
+
+  const view = await (await get("settings")).json();
+  assert.deepEqual(view.keys.openrouter, { source: "settings", hint: "\u2022\u2022\u2022\u20227890" });
+  assert.ok(!JSON.stringify(view).includes(VALID_OR_KEY));
+
+  calls = [];
+  await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const sent = completions().map((c) => c.headers.Authorization);
+  assert.ok(sent.length && sent.every((h) => h === `Bearer ${VALID_OR_KEY}`), "answers use the saved key");
+
+  assert.equal((await put("settings/keys", { name: "openrouter", value: null })).status, 200);
+  assert.deepEqual(db.vault, {});
+  assert.equal((await (await get("settings")).json()).keys.openrouter.source, "supabase");
+});
+
+test("health counts a key saved on the Settings page even without the Supabase secret", async () => {
+  delete ENV.OPENROUTER_API_KEY;
+  let data = await (await handler(new Request("https://p/functions/v1/research-api/health"))).json();
+  assert.equal(data.configured.openrouter, false);
+  db.vault.rfb_openrouter_api_key = VALID_OR_KEY;
+  data = await (await handler(new Request("https://p/functions/v1/research-api/health"))).json();
+  assert.equal(data.configured.openrouter, true);
+});
+
+test("documents route includes the document loader's last run", async () => {
+  db.appSettings.library = { folderId: "folder123", finishedAt: "2026-10-12T09:04:00Z", loaded: 2 };
+  const data = await (await get("documents")).json();
+  assert.deepEqual(data.library, { folderId: "folder123", finishedAt: "2026-10-12T09:04:00Z", loaded: 2 });
+});
+
+test("unknown routes are 404 without touching auth", async () => {
+  const res = await get("nope");
+  assert.equal(res.status, 404);
+  assert.equal(calls.length, 0);
 });
 
 test("documents route returns corpus status", async () => {

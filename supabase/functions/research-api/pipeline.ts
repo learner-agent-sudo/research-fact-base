@@ -216,6 +216,7 @@ type Msg = { role: string; content: string };
 
 interface CatalogModel {
   id: string;
+  name?: string;
   created?: number;
   context_length?: number;
   pricing?: { prompt?: string; completion?: string };
@@ -297,6 +298,35 @@ export async function resolveModels(cfg: Config, tier: Tier, signal?: AbortSigna
   const checker = pick(configured.checker).slice(0, 4);
   if (!generators.length || !checker.length) return configured;
   return { generators, checker };
+}
+
+export interface ModelOption {
+  id: string;
+  name: string;
+  context?: number;
+}
+
+const PAID_PROVIDERS = /^(anthropic|openai|google|x-ai|deepseek|mistralai|qwen|meta-llama|moonshotai)\//;
+
+/** Choices for the Settings page: chat models free right now, and paid ones from major providers. */
+export async function modelOptions(
+  cfg: Config,
+  signal?: AbortSignal,
+): Promise<{ free: ModelOption[]; paid: ModelOption[] } | null> {
+  const models = await modelCatalog(cfg, signal);
+  if (!models) return null;
+  const chat = (m: CatalogModel) => (m.context_length ?? 0) >= 16_000 && !NOT_CHAT.test(m.id);
+  const option = (m: CatalogModel): ModelOption => ({ id: m.id, name: m.name || m.id, context: m.context_length });
+  return {
+    free: models
+      .filter((m) => isFree(m) && chat(m))
+      .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
+      .map(option),
+    paid: models
+      .filter((m) => !isFree(m) && chat(m) && PAID_PROVIDERS.test(m.id))
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map(option),
+  };
 }
 
 export async function chatComplete(

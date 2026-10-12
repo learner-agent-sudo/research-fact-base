@@ -148,16 +148,19 @@ test.describe("sign-in", () => {
     await page.reload();
     await expect(page.getByPlaceholder("Ask about your documents…")).toBeVisible();
 
+    await page.getByRole("link", { name: "Settings" }).click();
     await page.getByRole("button", { name: "Sign out" }).click();
     await expect(page.getByLabel("Email")).toBeVisible();
     await page.reload();
     await expect(page.getByLabel("Email")).toBeVisible();
   });
 
-  test("the corpus page also requires sign-in", async ({ page }) => {
-    await page.goto("./admin/");
-    await expect(page.getByLabel("Email")).toBeVisible();
-    expect(world.apiRequests.filter((r) => r.route === "documents")).toHaveLength(0);
+  test("the documents and settings pages also require sign-in", async ({ page }) => {
+    for (const path of ["./documents/", "./settings/"]) {
+      await page.goto(path);
+      await expect(page.getByLabel("Email")).toBeVisible();
+    }
+    expect(world.apiRequests.filter((r) => r.route === "documents" || r.route === "settings")).toHaveLength(0);
   });
 });
 
@@ -204,10 +207,10 @@ test.describe("research chat", () => {
     expect(second.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
   });
 
-  test("re-run with Claude sends the paid tier", async ({ page }) => {
+  test("re-run with the paid model sends the paid tier", async ({ page }) => {
     await signIn(page);
     await ask(page);
-    await page.getByRole("button", { name: "↑ Re-run with Claude (paid)" }).click();
+    await page.getByRole("button", { name: "↑ Re-run with the paid model" }).click();
     await expect(page.getByText(/drafted by anthropic\/claude-sonnet-4\.5/)).toBeVisible();
     const last = world.apiRequests.filter((r) => r.route === "chat").at(-1)!;
     expect((last.body as { tier: string }).tier).toBe("paid");
@@ -237,15 +240,15 @@ test.describe("research chat", () => {
     await expect(page.getByText("Your session has expired. Please sign in again.")).toBeVisible();
   });
 
-  test("the corpus page lists documents and their status", async ({ page }) => {
+  test("the documents page lists documents and their status", async ({ page }) => {
     await signIn(page);
-    await page.getByRole("link", { name: "Corpus" }).click();
-    await expect(page).toHaveURL(/\/research-fact-base\/admin\/$/);
+    await page.getByRole("link", { name: "Documents" }).click();
+    await expect(page).toHaveURL(/\/research-fact-base\/documents\/$/);
     await expect(page.getByText("Contract Case List 2024.md")).toBeVisible();
     await expect(page.getByText("family-law.md")).toBeVisible();
-    await expect(page.getByText("1,234")).toBeVisible();
+    await expect(page.getByText("1,234 searchable passages")).toBeVisible();
     await expectNoHorizontalScroll(page);
-    await page.getByRole("link", { name: "← chat" }).click();
+    await page.getByRole("link", { name: "Ask" }).click();
     await expect(page.getByPlaceholder("Ask about your documents…")).toBeVisible();
   });
 });

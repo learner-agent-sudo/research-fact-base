@@ -393,6 +393,25 @@ async function main() {
     .select("id", { count: "exact", head: true })
     .neq("status", "ready");
 
+  // Shown on the website's Documents page: when this last ran, and a link to the folder.
+  const removed = report.skipped.filter((x) => x.startsWith("(removed")).length;
+  const { error: statusError } = await supabase.from("app_settings").upsert({
+    key: "library",
+    value: {
+      folderId: FOLDER_ID,
+      finishedAt: new Date().toISOString(),
+      loaded: report.loaded.length,
+      unchanged: report.unchanged.length,
+      skipped: report.skipped.length - removed,
+      removed,
+      errored: report.errored.length,
+      stoppedEarly: Boolean(quotaHit),
+    },
+    updated_at: new Date().toISOString(),
+    updated_by: "ingest",
+  });
+  if (statusError) console.log(`(Couldn't record this run for the website: ${statusError.message})`);
+
   console.log(`\nTotal embedded chunks now in the database: ${count}`);
   if (quotaHit) {
     console.log(`\n⏸  STOPPED EARLY — embedding quota exhausted (${quotaHit}).`);

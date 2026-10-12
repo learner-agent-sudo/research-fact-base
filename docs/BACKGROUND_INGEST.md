@@ -42,8 +42,9 @@ New repository secret**. Add all five:
 
 ### 3. Run it
 GitHub → **Actions → Ingest Drive corpus → Run workflow.** Watch the log: it prints
-each file as it embeds and ends with an **INGEST REPORT**. Files flip to `ready`
-in the app's `/admin` page as they finish.
+each file as it embeds and ends with an **INGEST REPORT**. Files flip to **Ready**
+on the site's **Documents** page as they finish. Each run also records when
+it ran and what changed, which the Documents page shows.
 
 It also runs **daily at 09:00 UTC** (just after the free quota resets). Free embedding tiers have a per-day quota,
 so a large corpus may take several runs: when the quota runs out the job stops

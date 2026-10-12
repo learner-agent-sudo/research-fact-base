@@ -36,6 +36,10 @@ Supabase dashboard → project **research-fact-base** → **Edge Functions** →
 `SUPABASE_URL` and the service-role key are provided to the function
 automatically — don't add them.
 
+The two API keys can instead be entered on the site's **Settings** page, which
+tests them, stores them encrypted in Supabase Vault and uses them in preference
+to these secrets. `ALLOWED_EMAILS` can only be set here.
+
 ### 2. Point sign-in links at the site
 Supabase → **Authentication** → **URL Configuration**:
 
@@ -101,7 +105,25 @@ Supabase CLI: `supabase functions deploy research-api --no-verify-jwt`.
 (valid session **and** allowlisted email), and the gateway's JWT check would
 reject the browser's CORS preflight requests.
 
+## The Settings page
+
+Everyone on `ALLOWED_EMAILS` can change these; they apply to all users.
+
+- **Appearance** — light, dark or match the device (saved per browser).
+- **AI and answers** — default answer mode (Free / Paid), drafting models per
+  question (1–3), passages searched per question, which free models to use
+  (or automatic), and the paid model.
+- **API keys** — OpenRouter and Gemini keys: tested before saving, stored in
+  Supabase Vault, shown only by their last four characters.
+- **Account and this device** — sign out (which also deletes the saved
+  conversation from that browser) or clear the saved conversation.
+
+Settings are stored in the `app_settings` table (migration
+`0003_settings.sql`), readable only by the edge function.
+
 ## Tuning (optional secrets)
+
+Settings saved on the Settings page take precedence over these.
 
 | Secret | Default | Effect |
 |---|---|---|

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
 import type { Session } from "@supabase/supabase-js";
+import { applyDefaultTier, attachUser, type Tier } from "@/lib/chatStore";
 import { BASE_PATH, api, configured, errorMessage, supabase } from "@/lib/supabase";
 
 type Status =
@@ -78,11 +79,16 @@ export default function AuthGate({ children }: { children: (session: Session) =>
 
   // Signed in is not the same as allowed: ask the API before showing the app,
   // so a wrong account or missing server setting is explained up front.
-  const checkAccess = useCallback(async () => {
+  const checkAccess = useCallback(async (userId: string) => {
     setAccess({ kind: "checking" });
     try {
       const res = await api("/me");
-      if (res.ok) return setAccess({ kind: "ok" });
+      if (res.ok) {
+        const me = (await res.json().catch(() => ({}))) as { defaultTier?: Tier };
+        attachUser(userId);
+        if (me.defaultTier === "free" || me.defaultTier === "paid") applyDefaultTier(me.defaultTier);
+        return setAccess({ kind: "ok" });
+      }
       const message = await errorMessage(res);
       if (res.status === 401) {
         await supabase!.auth.signOut();
@@ -100,7 +106,7 @@ export default function AuthGate({ children }: { children: (session: Session) =>
 
   const userId = session?.user.id;
   useEffect(() => {
-    if (userId) checkAccess();
+    if (userId) checkAccess(userId);
   }, [userId, checkAccess]);
 
   if (!configured) {
@@ -132,7 +138,7 @@ export default function AuthGate({ children }: { children: (session: Session) =>
             {access.message}
           </p>
           <div className="mt-4 flex gap-2">
-            <button onClick={checkAccess} className={BUTTON}>
+            <button onClick={() => checkAccess(session.user.id)} className={BUTTON}>
               Try again
             </button>
             <button onClick={() => supabase!.auth.signOut()} className={BUTTON_SECONDARY}>

@@ -13,6 +13,7 @@ export const SUPABASE_URL = process.env.E2E_SUPABASE_URL ?? "https://zfzydmozafe
 export const ALLOWED = "owner@example.com";
 export const STRANGER = "stranger@example.com";
 export const CODE = "246810";
+export const VALID_OPENROUTER_KEY = "sk-or-v1-e2e-valid-key-4321";
 
 const CHECKER_OUTPUT =
   "There is a duty of honest performance (Bhasin v Hrynew, 2014 SCC 71) [S1]. " +
@@ -31,8 +32,9 @@ const ROWS = [
 ];
 
 const DOCS = [
-  { id: "d1", title: "Contract Case List 2024.md", mime_type: "text/markdown", status: "ready" },
-  { id: "d2", title: "family-law.md", mime_type: "text/markdown", status: "ingesting" },
+  { id: "d1", title: "Contract Case List 2024.md", mime_type: "text/markdown", status: "ready", drive_file_id: "abc123" },
+  { id: "d2", title: "family-law.md", mime_type: "text/markdown", status: "ingesting", drive_file_id: "def456" },
+  { id: "d3", title: "Scanned judgment.pdf", mime_type: "application/pdf", status: "error", drive_file_id: "ghi789" },
 ];
 
 function freshEnv(): Record<string, string | undefined> {
@@ -55,8 +57,17 @@ export const world = {
   verifyRequests: [] as Record<string, unknown>[],
   apiRequests: [] as { route: string; headers: Record<string, string>; body: unknown }[],
   modelCalls: [] as string[],
+  /** Authorization header of each AI request (to see which key was used). */
+  modelKeys: [] as string[],
   logouts: 0,
   leaked: [] as string[],
+  /** OpenRouter's model list; null = unavailable (the function then uses its configured models). */
+  catalog: null as null | { id: string; name?: string; context_length?: number; pricing?: { prompt: string; completion: string } }[],
+  /** Simulated database: app_settings rows and Vault secrets. */
+  appSettings: {} as Record<string, unknown>,
+  vault: {} as Record<string, string>,
+  /** Holds each answer back this long, to test leaving the page mid-answer. */
+  chatDelayMs: 0,
 };
 
 const accessTokens = new Map<string, string>(); // access token -> email
@@ -70,8 +81,16 @@ export function resetWorld() {
   world.verifyRequests = [];
   world.apiRequests = [];
   world.modelCalls = [];
+  world.modelKeys = [];
   world.logouts = 0;
   world.leaked = [];
+  world.catalog = null;
+  world.appSettings = {};
+  world.vault = {};
+  world.chatDelayMs = 0;
+  // The function caches OpenRouter's model list; start each test without it.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  (require("../supabase/functions/research-api/pipeline.ts") as { clearModelCatalog: () => void }).clearModelCatalog();
   accessTokens.clear();
   refreshTokens.clear();
 }
@@ -201,18 +220,39 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     return email ? reply(userFor(email)) : reply({ msg: "invalid JWT" }, 403);
   }
   if (url.startsWith(`${SUPABASE_URL}/auth/v1/admin/`)) return reply({ msg: "not admin" }, 401);
+  if (url.startsWith(`${SUPABASE_URL}/rest/v1/app_settings`)) {
+    if (init?.method === "POST") {
+      const row = body as { key: string; value: unknown };
+      world.appSettings[row.key] = row.value;
+      return new Response(null, { status: 201 });
+    }
+    return reply(Object.entries(world.appSettings).map(([key, value]) => ({ key, value })));
+  }
+  if (url === `${SUPABASE_URL}/rest/v1/rpc/app_secret_get`) {
+    return reply(world.vault[(body as { p_name: string }).p_name] ?? null);
+  }
+  if (url === `${SUPABASE_URL}/rest/v1/rpc/app_secret_set`) {
+    const { p_name, p_value } = body as { p_name: string; p_value: string | null };
+    if (p_value) world.vault[p_name] = p_value;
+    else delete world.vault[p_name];
+    return new Response(null, { status: 204 });
+  }
+  if (url === "https://openrouter.ai/api/v1/key") {
+    return bearer(headers) === VALID_OPENROUTER_KEY ? reply({ data: {} }) : reply({ error: "No auth" }, 401);
+  }
   if (url.includes(":embedContent")) {
     return reply({ embedding: { values: Array.from({ length: 1024 }, (_, i) => (i % 7) / 7) } });
   }
   if (url === `${SUPABASE_URL}/rest/v1/rpc/match_chunks`) return reply(world.rows);
   if (url.startsWith(`${SUPABASE_URL}/rest/v1/documents`)) return reply(DOCS);
   if (url.startsWith(`${SUPABASE_URL}/rest/v1/chunks`)) return reply([{ id: "c1" }], 200, { "content-range": "0-0/1234" });
-  // Model list unavailable: the function falls back to its configured models
-  // (model selection itself is covered by the edge function's unit tests).
-  if (url === "https://openrouter.ai/api/v1/models") return reply({ error: "unavailable" }, 503);
+  if (url === "https://openrouter.ai/api/v1/models") {
+    return world.catalog ? reply({ data: world.catalog }) : reply({ error: "unavailable" }, 503);
+  }
   if (url === "https://openrouter.ai/api/v1/chat/completions") {
     const { model, messages } = body as { model: string; messages: { content: string }[] };
     world.modelCalls.push(model);
+    world.modelKeys.push(headers.authorization ?? "");
     const isChecker = messages[0].content.startsWith("You are a strict verifier");
     return reply({ choices: [{ message: { content: isChecker ? CHECKER_OUTPUT : "draft answer [S1]" } }] });
   }
@@ -234,10 +274,11 @@ async function realApi(route: Route) {
   const headers = await req.allHeaders();
   const method = req.method();
   const raw = req.postDataBuffer();
-  const apiRoute = new URL(req.url()).pathname.split("/").pop() ?? "";
+  const apiRoute = new URL(req.url()).pathname.replace(/^.*\/research-api\//, "");
   if (method !== "OPTIONS") {
     world.apiRequests.push({ route: apiRoute, headers, body: raw ? JSON.parse(raw.toString()) : undefined });
   }
+  if (apiRoute === "chat" && world.chatDelayMs) await new Promise((r) => setTimeout(r, world.chatDelayMs));
   const forwarded = Object.fromEntries(Object.entries(headers).filter(([k]) => !k.startsWith(":") && k !== "host"));
   const res = await edgeFunction()(
     new Request(req.url(), {
