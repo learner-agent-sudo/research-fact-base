@@ -475,12 +475,14 @@ async function runChecker(
   ];
 
   // A fallback checker only gets a try if there's a sensible amount of time left.
+  // (The overall deadline arrives via `signal`; it isn't also used as this call's
+  // own timeout, so running out of time is always reported as such.)
   const minTry = Math.min(10_000, cfg.timeLimitMs / 10);
   const errors: string[] = [];
   for (const model of models) {
     if (errors.length && timeLeft() < minTry) break;
     try {
-      const raw = await chatComplete(cfg, model, messages, Math.min(cfg.checkerTimeoutMs, timeLeft()), 0.1, signal);
+      const raw = await chatComplete(cfg, model, messages, cfg.checkerTimeoutMs, 0.1, signal);
       return { ...parseCheckerOutput(raw, sources.length > 0), model };
     } catch (err) {
       if (signal?.aborted) throw err;
