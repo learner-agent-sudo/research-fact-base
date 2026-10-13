@@ -9,6 +9,7 @@ import {
   chooseTier,
   newConversation,
   rerunWithPaid,
+  stopAnswer,
   useChat,
   type CitationCheck,
   type Confidence,
@@ -92,13 +93,23 @@ export default function Chat() {
             placeholder="Ask about your documents…"
             className="max-h-40 flex-1 resize-none rounded-xl border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:border-neutral-500"
           />
-          <button
-            type="submit"
-            disabled={busy || !input.trim()}
-            className="rounded-xl bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
-          >
-            {busy ? "…" : "Send"}
-          </button>
+          {busy ? (
+            <button
+              type="button"
+              onClick={stopAnswer}
+              className="rounded-xl border border-neutral-300 bg-white px-4 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-100"
+            >
+              Stop
+            </button>
+          ) : (
+            <button
+              type="submit"
+              disabled={!input.trim()}
+              className="rounded-xl bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            >
+              Send
+            </button>
+          )}
         </form>
         <p className="pb-3 text-center text-[11px] text-neutral-400">Legal information, not legal advice.</p>
       </div>
@@ -163,6 +174,7 @@ function Bubble({ m, onEscalate, busy }: { m: Msg; onEscalate: () => void; busy:
         <div className="flex items-center gap-2 text-sm text-neutral-500">
           <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-neutral-400" />
           {stageLabel(m)}
+          {m.startedAt && <Elapsed since={m.startedAt} />}
         </div>
       ) : (
         m.content && (
@@ -209,6 +221,22 @@ function Bubble({ m, onEscalate, busy }: { m: Msg; onEscalate: () => void; busy:
         </div>
       )}
     </div>
+  );
+}
+
+/** Seconds since the question was asked, once it's been a while. */
+function Elapsed({ since }: { since: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const s = Math.max(0, Math.round((now - since) / 1000));
+  if (s < 10) return null;
+  return (
+    <span className="text-xs text-neutral-400">
+      {s}s{s >= 60 && " · free models can be slow; you can press Stop and try Paid"}
+    </span>
   );
 }
 

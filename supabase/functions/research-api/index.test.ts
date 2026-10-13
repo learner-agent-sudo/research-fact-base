@@ -39,6 +39,8 @@ interface Scenario {
   user?: { email: string } | null;
   rows?: unknown[];
   checkerFailsFirst?: boolean;
+  /** How long a model takes to answer, in ms (aborting the request ends the wait, as with real fetch). */
+  delayMs?: (model: string, role: "draft" | "check") => number;
   /** OpenRouter's model list; unset = the list can't be fetched. */
   catalog?: { id: string; created?: number; context_length?: number; pricing?: { prompt: string; completion: string } }[];
 }
@@ -48,6 +50,14 @@ let db: { appSettings: Record<string, unknown>; vault: Record<string, string> } 
 const VALID_OR_KEY = "sk-or-v1-valid-key-1234567890";
 const BAD_GEMINI_KEY = "AIza-revoked-key-000000000";
 let calls: { url: string; body?: unknown; headers: Record<string, string> }[] = [];
+
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => (clearTimeout(t), reject(signal.reason)), { once: true });
+  });
+}
 
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input);
@@ -99,8 +109,10 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     return scenario.catalog ? reply({ data: scenario.catalog }) : reply({ error: "unavailable" }, 503);
   }
   if (url.includes("openrouter.ai")) {
-    const system = (body as { messages: { content: string }[] }).messages[0].content;
-    const isChecker = system.startsWith("You are a strict verifier");
+    const { model, messages } = body as { model: string; messages: { content: string }[] };
+    const isChecker = messages[0].content.startsWith("You are a strict verifier");
+    const wait = scenario.delayMs?.(model, isChecker ? "check" : "draft") ?? 0;
+    if (wait) await sleep(wait, init?.signal);
     if (isChecker) {
       const priorCheckerCalls = calls.filter(
         (c) => c.url.endsWith("/chat/completions") &&
@@ -241,7 +253,7 @@ test("full pipeline: grounded answer, fabricated citation removed before sending
 
   assert.deepEqual(
     evs.map((e) => (e.type === "stage" ? `stage:${e.stage}` : e.type)),
-    ["stage:retrieving", "sources", "meta", "stage:drafting", "stage:checking", "stage:verifying", "final", "done"],
+    ["stage:retrieving", "sources", "meta", "stage:drafting", "meta", "stage:checking", "stage:verifying", "final", "done"],
   );
   const final = evs.find((e) => e.type === "final") as { text: string; removed: unknown[]; quotes: { status: string }[] };
   assert.equal(final.text, "There is a duty of honest performance (Bhasin v Hrynew, 2014 SCC 71) [S1].");
@@ -280,6 +292,43 @@ test("checker falls back to the next model when the first is unavailable", async
   const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
   const final = evs.find((e) => e.type === "final") as { checker: string };
   assert.equal(final.checker, "deepseek/deepseek-chat-v3-0324:free");
+});
+
+test("a slow drafting model isn't waited for once the others have answered", async () => {
+  ENV.DRAFT_GRACE_MS = "50";
+  scenario.delayMs = (model, role) => (role === "draft" && model.startsWith("qwen/") ? 60_000 : 0);
+  const started = Date.now();
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  assert.ok(Date.now() - started < 5_000, "did not wait for the slow model");
+  assert.ok(evs.some((e) => e.type === "done"));
+  // The answer credits only the models whose drafts were used.
+  const metas = evs.filter((e) => e.type === "meta") as { generators: string[] }[];
+  assert.equal(metas[0].generators.length, 3);
+  assert.deepEqual(metas[1].generators, ["meta-llama/llama-3.3-70b-instruct:free", "deepseek/deepseek-chat-v3-0324:free"]);
+});
+
+test("models too slow to finish in time: a clear message is sent before the time limit", async () => {
+  ENV.TIME_LIMIT_MS = "1500";
+  scenario.delayMs = (_model, role) => (role === "check" ? 60_000 : 0);
+  const started = Date.now();
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 1_400 && elapsed < 4_000, `stopped at the time limit (took ${elapsed}ms)`);
+  const err = evs.find((e) => e.type === "error") as { message: string };
+  assert.match(err.message, /didn't finish within 2 seconds.*switch to Paid/s);
+  assert.ok(!evs.some((e) => e.type === "final"), "no unchecked answer is shown");
+});
+
+test("slow drafting can't use up the time needed for checking", async () => {
+  ENV.TIME_LIMIT_MS = "1500";
+  scenario.delayMs = (_model, role) => (role === "draft" ? 60_000 : 0);
+  const started = Date.now();
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  assert.ok(Date.now() - started < 1_400, "drafting was cut short, leaving time to check");
+  // With no drafts, the checker writes the answer from the sources, and it is still verified.
+  const final = evs.find((e) => e.type === "final") as { text: string; checker: string };
+  assert.match(final.text, /duty of honest performance/);
+  assert.ok(evs.some((e) => e.type === "done"));
 });
 
 const FREE = { prompt: "0", completion: "0" };

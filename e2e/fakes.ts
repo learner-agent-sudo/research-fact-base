@@ -68,6 +68,12 @@ export const world = {
   vault: {} as Record<string, string>,
   /** Holds each answer back this long, to test leaving the page mid-answer. */
   chatDelayMs: 0,
+  /** The answer never arrives (the connection stays open, silent). */
+  chatHang: false,
+  /** The answer's stream ends early, before the final answer. */
+  chatTruncate: false,
+  /** How long each AI model takes to reply, in ms. */
+  modelDelayMs: { draft: 0, check: 0 },
 };
 
 const accessTokens = new Map<string, string>(); // access token -> email
@@ -88,6 +94,9 @@ export function resetWorld() {
   world.appSettings = {};
   world.vault = {};
   world.chatDelayMs = 0;
+  world.chatHang = false;
+  world.chatTruncate = false;
+  world.modelDelayMs = { draft: 0, check: 0 };
   // The function caches OpenRouter's model list; start each test without it.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   (require("../supabase/functions/research-api/pipeline.ts") as { clearModelCatalog: () => void }).clearModelCatalog();
@@ -208,6 +217,15 @@ async function fakeAuth(route: Route) {
 
 (globalThis as unknown as { Deno: unknown }).Deno = { env: { get: (k: string) => world.env[k] } };
 
+/** Waits like a slow service would; aborting the request ends the wait, as with real fetch. */
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => (clearTimeout(t), reject(signal.reason)), { once: true });
+  });
+}
+
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input);
   const headers = Object.fromEntries(new Headers(init?.headers).entries());
@@ -254,6 +272,7 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     world.modelCalls.push(model);
     world.modelKeys.push(headers.authorization ?? "");
     const isChecker = messages[0].content.startsWith("You are a strict verifier");
+    await sleep(world.modelDelayMs[isChecker ? "check" : "draft"], init?.signal);
     return reply({ choices: [{ message: { content: isChecker ? CHECKER_OUTPUT : "draft answer [S1]" } }] });
   }
   world.leaked.push(`edge function -> ${url}`);
@@ -278,6 +297,11 @@ async function realApi(route: Route) {
   if (method !== "OPTIONS") {
     world.apiRequests.push({ route: apiRoute, headers, body: raw ? JSON.parse(raw.toString()) : undefined });
   }
+  if (apiRoute === "chat" && world.chatHang) {
+    // Never answer; let go of the request after the test is over.
+    await new Promise((r) => setTimeout(r, 30_000).unref());
+    return route.abort().catch(() => {});
+  }
   if (apiRoute === "chat" && world.chatDelayMs) await new Promise((r) => setTimeout(r, world.chatDelayMs));
   const forwarded = Object.fromEntries(Object.entries(headers).filter(([k]) => !k.startsWith(":") && k !== "host"));
   const res = await edgeFunction()(
@@ -287,11 +311,13 @@ async function realApi(route: Route) {
       body: method === "GET" || method === "OPTIONS" || !raw ? undefined : new Uint8Array(raw),
     }),
   );
-  await route.fulfill({
-    status: res.status,
-    headers: Object.fromEntries(res.headers.entries()),
-    body: Buffer.from(await res.arrayBuffer()),
-  });
+  let body = Buffer.from(await res.arrayBuffer());
+  if (apiRoute === "chat" && world.chatTruncate) {
+    const lines = body.toString().split("\n");
+    body = Buffer.from(lines.slice(0, lines.findIndex((l) => l.includes('"type":"final"'))).join("\n") + "\n");
+  }
+  // The page may have stopped waiting (Stop, reload) while the answer was prepared.
+  await route.fulfill({ status: res.status, headers: Object.fromEntries(res.headers.entries()), body }).catch(() => {});
 }
 
 /** Routes the page's network: the site itself is served locally; nothing else leaves the machine. */

@@ -79,6 +79,56 @@ test.describe("conversation", () => {
     await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
   });
 
+  test("an answer that never arrives is abandoned with a clear message, not left spinning", async ({ page }) => {
+    await page.addInitScript(() => {
+      (window as unknown as { __rfbChatLimits: object }).__rfbChatLimits = { stallMs: 2000 };
+    });
+    world.chatHang = true;
+    await signIn(page);
+    await ask(page);
+    await expect(page.getByText("Searching your documents…")).toBeVisible();
+    await expect(page.getByText(/The research service stopped responding/)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+
+    // The next question works normally.
+    world.chatHang = false;
+    await ask(page, "Try again");
+    await expect(page.locator(".answer")).toContainText(ANSWER);
+  });
+
+  test("Stop cancels an answer in progress", async ({ page }) => {
+    world.chatDelayMs = 10_000;
+    await signIn(page);
+    await ask(page);
+    await expect(page.getByRole("button", { name: "Send" })).toHaveCount(0);
+    await page.getByRole("button", { name: "Stop" }).click();
+    await expect(page.getByText("You stopped this answer.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+    await expect(page.getByTitle("An answer is being prepared")).toHaveCount(0);
+
+    await page.reload();
+    await expect(page.getByText("You stopped this answer.")).toBeVisible();
+  });
+
+  test("an answer cut short is reported, not shown as finished", async ({ page }) => {
+    world.chatTruncate = true;
+    await signIn(page);
+    await ask(page);
+    await expect(page.getByText("The answer stopped before it finished. Please ask again.")).toBeVisible();
+    await expect(page.locator(".answer")).toHaveCount(0);
+  });
+
+  test("when the AI models are too slow, the server's time limit message is shown", async ({ page }) => {
+    world.env.TIME_LIMIT_MS = "1500";
+    world.modelDelayMs.check = 60_000;
+    await signIn(page);
+    await ask(page);
+    await expect(page.getByText(/didn't finish within 2 seconds/)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/switch to Paid for this question/)).toBeVisible();
+    await expect(page.locator(".answer")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
+  });
+
   test("New conversation starts afresh, and follow-ups don't carry the old one", async ({ page }) => {
     await signIn(page);
     await ask(page);

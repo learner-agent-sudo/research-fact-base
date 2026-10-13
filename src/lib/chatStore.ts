@@ -48,6 +48,8 @@ export interface Msg {
   confidence?: Confidence;
   unsupported?: string[];
   pending?: boolean;
+  /** When the answer was requested (ms since epoch), to show how long it's taking. */
+  startedAt?: number;
   error?: string;
 }
 
@@ -64,11 +66,25 @@ const PREFIX = "rfb.chat.v1.";
 const MAX_SAVED = 40; // messages kept on the device (20 questions and answers)
 export const INTERRUPTED =
   "This answer was interrupted because the page was closed or reloaded before it finished. Please ask again.";
+export const STOPPED = "You stopped this answer.";
+export const STALLED =
+  "The research service stopped responding, so this answer was abandoned. Please ask again, or switch to Paid.";
+export const TOO_LONG = "This answer took more than 3 minutes, so it was stopped. Please ask again, or switch to Paid.";
+export const INCOMPLETE = "The answer stopped before it finished. Please ask again.";
+
+// The server sends a keep-alive every 10 seconds while it works, and always
+// finishes within about 2 minutes, so these only trip if something is wrong.
+// (The browser tests shorten them via window.__rfbChatLimits.)
+function limits() {
+  const override = (globalThis as { __rfbChatLimits?: { stallMs?: number; maxMs?: number } }).__rfbChatLimits;
+  return { stallMs: 45_000, maxMs: 180_000, ...override };
+}
 
 const INITIAL: ChatState = { userId: null, messages: [], tier: "free", tierChosen: false, busy: false };
 let state: ChatState = INITIAL;
 let epoch = 0; // bumped whenever the conversation is replaced, so stale answers are dropped
-let controller: AbortController | null = null;
+/** Cancels the answer in progress, if any, showing the given message. */
+let cancel: ((why: string) => void) | null = null;
 const listeners = new Set<() => void>();
 
 function persist() {
@@ -150,7 +166,7 @@ export function newConversation() {
 
 /** Forgets every saved conversation on this device. */
 export function clearSavedConversations() {
-  controller?.abort();
+  cancel?.(INTERRUPTED);
   try {
     for (const k of Object.keys(localStorage)) if (k.startsWith(PREFIX)) localStorage.removeItem(k);
   } catch {
@@ -182,6 +198,10 @@ export function ask(question: string) {
   void run(turns, state.tier);
 }
 
+export function stopAnswer() {
+  cancel?.(STOPPED);
+}
+
 export function rerunWithPaid() {
   const lastUser = state.messages.map((m) => m.role).lastIndexOf("user");
   if (lastUser < 0 || state.busy) return;
@@ -198,8 +218,27 @@ async function run(turns: { role: string; content: string }[], tier: Tier) {
     set({ messages });
   };
 
-  set({ messages: [...state.messages, { role: "assistant", content: "", pending: true, tier }], busy: true });
-  controller = new AbortController();
+  set({
+    messages: [...state.messages, { role: "assistant", content: "", pending: true, tier, startedAt: Date.now() }],
+    busy: true,
+  });
+
+  // Give up if the service goes quiet or takes far too long, rather than waiting forever.
+  const controller = new AbortController();
+  let reason: string | null = null;
+  const giveUp = (why: string) => {
+    reason ??= why;
+    controller.abort();
+  };
+  cancel = giveUp;
+  const { stallMs, maxMs } = limits();
+  let stall = setTimeout(() => giveUp(STALLED), stallMs);
+  const overall = setTimeout(() => giveUp(TOO_LONG), maxMs);
+  const alive = () => {
+    clearTimeout(stall);
+    stall = setTimeout(() => giveUp(STALLED), stallMs);
+  };
+
   try {
     const res = await api("/chat", {
       method: "POST",
@@ -212,9 +251,11 @@ async function run(turns: { role: string; content: string }[], tier: Tier) {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
+    let finished = false;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      alive();
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split("\n");
       buf = lines.pop() ?? "";
@@ -246,18 +287,23 @@ async function run(turns: { role: string; content: string }[], tier: Tier) {
             });
             break;
           case "done":
+            finished = true;
             patch({ confidence: ev.confidence as Confidence, unsupported: ev.unsupported as string[], pending: false });
             break;
           case "error":
+            finished = true;
             patch({ error: ev.message as string, pending: false });
             break;
         }
       }
     }
-    patch({ pending: false });
+    patch(finished ? { pending: false } : { error: INCOMPLETE, pending: false });
   } catch (e) {
-    if (epoch === myEpoch) patch({ error: describeFailure(e), pending: false });
+    if (epoch === myEpoch) patch({ error: reason ?? describeFailure(e), pending: false });
   } finally {
+    clearTimeout(stall);
+    clearTimeout(overall);
+    if (cancel === giveUp) cancel = null;
     if (epoch === myEpoch) set({ busy: false });
   }
 }

@@ -77,6 +77,10 @@ export interface Config {
   appUrl: string;
   generatorTimeoutMs: number;
   checkerTimeoutMs: number;
+  /** The whole answer must be sent within this; Supabase stops a request at 150s (free plan). */
+  timeLimitMs: number;
+  /** Once one draft is in, how much longer to wait for the other drafting models. */
+  draftGraceMs: number;
 }
 
 /** A misconfiguration the operator must fix - shown to the user verbatim. */
@@ -131,10 +135,22 @@ export function formatSources(sources: Source[]): string {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
-  const timeout = AbortSignal.timeout(ms);
+/** Aborts when any of the given signals does. */
+function anySignal(...signals: (AbortSignal | undefined)[]): AbortSignal {
+  const list = signals.filter((s): s is AbortSignal => s !== undefined);
+  if (list.length === 1) return list[0];
   const any = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
-  return signal && any ? any([signal, timeout]) : timeout;
+  if (any) return any(list);
+  const c = new AbortController();
+  for (const s of list) {
+    if (s.aborted) c.abort(s.reason);
+    else s.addEventListener("abort", () => c.abort(s.reason), { once: true });
+  }
+  return c.signal;
+}
+
+function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
+  return anySignal(signal, AbortSignal.timeout(Math.max(1, ms)));
 }
 
 /** Legacy service_role keys are JWTs (sent as Bearer too); new sb_secret_ keys go in apikey only. */
@@ -368,6 +384,7 @@ async function runGenerators(
   question: string,
   history: ChatMessage[],
   sources: Source[],
+  timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<Draft[]> {
   const messages: Msg[] = [
@@ -375,13 +392,26 @@ async function runGenerators(
     ...history,
     { role: "user", content: `SOURCES:\n${formatSources(sources)}\n\nQUESTION:\n${question}` },
   ];
+  // Once one draft is in, wait only a little longer for the others: one slow
+  // free model shouldn't hold up the whole answer.
+  const enough = new AbortController();
+  let grace: ReturnType<typeof setTimeout> | undefined;
   const settled = await Promise.allSettled(
-    models.map((m) => chatComplete(cfg, m, messages, cfg.generatorTimeoutMs, 0.2, signal)),
+    models.map(async (m) => {
+      const content = await chatComplete(cfg, m, messages, timeoutMs, 0.2, anySignal(signal, enough.signal));
+      grace ??= setTimeout(() => enough.abort(), cfg.draftGraceMs);
+      return content;
+    }),
   );
+  clearTimeout(grace);
   return settled.map((r, i) =>
     r.status === "fulfilled"
       ? { model: models[i], content: r.value }
-      : { model: models[i], content: "", error: String(r.reason) },
+      : {
+        model: models[i],
+        content: "",
+        error: enough.signal.aborted && !signal?.aborted ? `${models[i]}: slower than the others, not waited for` : String(r.reason),
+      },
   );
 }
 
@@ -426,6 +456,7 @@ async function runChecker(
   history: ChatMessage[],
   sources: Source[],
   drafts: Draft[],
+  timeLeft: () => number,
   signal?: AbortSignal,
 ): Promise<{ answer: string; meta: CheckerMeta; model: string }> {
   const candidates =
@@ -443,10 +474,13 @@ async function runChecker(
     },
   ];
 
+  // A fallback checker only gets a try if there's a sensible amount of time left.
+  const minTry = Math.min(10_000, cfg.timeLimitMs / 10);
   const errors: string[] = [];
   for (const model of models) {
+    if (errors.length && timeLeft() < minTry) break;
     try {
-      const raw = await chatComplete(cfg, model, messages, cfg.checkerTimeoutMs, 0.1, signal);
+      const raw = await chatComplete(cfg, model, messages, Math.min(cfg.checkerTimeoutMs, timeLeft()), 0.1, signal);
       return { ...parseCheckerOutput(raw, sources.length > 0), model };
     } catch (err) {
       if (signal?.aborted) throw err;
@@ -456,8 +490,16 @@ async function runChecker(
   const draftErrors = drafts.filter((d) => d.error).map((d) => d.error!);
   throw new Error(
     "The AI models didn't respond. Free OpenRouter models are sometimes unavailable or rate-limited \u2014 " +
-      "try again shortly or use the Claude (paid) tier.\n\nDetails: " +
+      "try again shortly, or switch to Paid for this question.\n\nDetails: " +
       [...errors, ...draftErrors].join(" | ").slice(0, 600),
+  );
+}
+
+/** Shown when the models are too slow to answer within the time limit. */
+export function tooSlowMessage(cfg: Config): string {
+  return (
+    `The AI models didn't finish within ${Math.round(cfg.timeLimitMs / 1000)} seconds, so I stopped waiting. ` +
+    "Free models are sometimes slow or busy \u2014 try again in a minute, or switch to Paid for this question."
   );
 }
 
@@ -525,38 +567,61 @@ export async function runPipeline(
   const question = messages[messages.length - 1].content;
   const history = messages.slice(0, -1).slice(-6);
 
-  emit({ type: "stage", stage: "retrieving" });
-  const sources = await retrieve(cfg, question, signal);
-  emit({ type: "sources", sources });
+  // Every step shares one deadline, so the answer (or a clear error) is always
+  // sent before Supabase cuts the request off.
+  const started = Date.now();
+  const timeLeft = () => started + cfg.timeLimitMs - Date.now();
+  const budget = withTimeout(signal, cfg.timeLimitMs);
+  const timings: Record<string, number> = {};
+  const lap = (step: string) => (timings[step] = Date.now() - started);
 
-  if (!sources.length) {
-    // Deterministic abstention: nothing retrieved, so no model is asked to answer.
-    emit({ type: "final", text: ABSTAIN, removed: [], citations: [], quotes: [], checker: "" });
-    emit({ type: "done", confidence: "low", unsupported: [] });
-    return;
+  try {
+    emit({ type: "stage", stage: "retrieving" });
+    const sources = await retrieve(cfg, question, budget);
+    lap("retrieved");
+    emit({ type: "sources", sources });
+
+    if (!sources.length) {
+      // Deterministic abstention: nothing retrieved, so no model is asked to answer.
+      emit({ type: "final", text: ABSTAIN, removed: [], citations: [], quotes: [], checker: "" });
+      emit({ type: "done", confidence: "low", unsupported: [] });
+      return;
+    }
+
+    const set = await resolveModels(cfg, tier, budget);
+    const generators = set.generators.slice(0, Math.max(1, cfg.fanout));
+    emit({ type: "meta", tier, generators, checker: set.checker[0] ?? "" });
+
+    emit({ type: "stage", stage: "drafting" });
+    // Drafting may use just over half the remaining time; the rest is kept for checking.
+    const draftMs = Math.min(cfg.generatorTimeoutMs, Math.floor(timeLeft() * 0.55));
+    const drafts = await runGenerators(cfg, generators, question, history, sources, draftMs, budget);
+    lap("drafted");
+    // Credit only the models whose drafts were actually used.
+    emit({ type: "meta", tier, generators: drafts.filter((d) => d.content).map((d) => d.model), checker: set.checker[0] ?? "" });
+
+    emit({ type: "stage", stage: "checking" });
+    const checked = await runChecker(cfg, set.checker, question, history, sources, drafts, timeLeft, budget);
+    lap("checked");
+    // Timings and model names only (never the question), for diagnosing slow answers in the logs.
+    console.log(JSON.stringify({ event: "answer", tier, ms: timings, drafts: drafts.map((d) => !!d.content), checker: checked.model }));
+
+    emit({ type: "stage", stage: "verifying" });
+    const report = enforceGrounding(checked.answer, sources, checked.meta.quotes);
+    const { confidence, unsupported } = finalConfidence(checked.meta, report);
+
+    emit({
+      type: "final",
+      text: report.text,
+      removed: report.removed,
+      citations: report.citations,
+      quotes: report.quotes,
+      checker: checked.model,
+    });
+    emit({ type: "done", confidence, unsupported });
+  } catch (err) {
+    lap("failed");
+    console.log(JSON.stringify({ event: "answer_failed", tier, ms: timings, outOfTime: budget.aborted && !signal?.aborted }));
+    throw budget.aborted && !signal?.aborted ? new Error(tooSlowMessage(cfg)) : err;
   }
-
-  const set = await resolveModels(cfg, tier, signal);
-  const generators = set.generators.slice(0, Math.max(1, cfg.fanout));
-  emit({ type: "meta", tier, generators, checker: set.checker[0] ?? "" });
-
-  emit({ type: "stage", stage: "drafting" });
-  const drafts = await runGenerators(cfg, generators, question, history, sources, signal);
-
-  emit({ type: "stage", stage: "checking" });
-  const checked = await runChecker(cfg, set.checker, question, history, sources, drafts, signal);
-
-  emit({ type: "stage", stage: "verifying" });
-  const report = enforceGrounding(checked.answer, sources, checked.meta.quotes);
-  const { confidence, unsupported } = finalConfidence(checked.meta, report);
-
-  emit({
-    type: "final",
-    text: report.text,
-    removed: report.removed,
-    citations: report.citations,
-    quotes: report.quotes,
-    checker: checked.model,
-  });
-  emit({ type: "done", confidence, unsupported });
 }

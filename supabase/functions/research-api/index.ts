@@ -148,9 +148,11 @@ async function load(): Promise<{ cfg: Config; ai: AiSettings; library: LibrarySt
       },
     },
     appUrl: env("APP_URL") ?? "https://learner-agent-sudo.github.io/research-fact-base/",
-    // Supabase free tier caps a request at 150s wall-clock: drafts + check must fit.
     generatorTimeoutMs: num("GENERATOR_TIMEOUT_MS", 50_000),
     checkerTimeoutMs: num("CHECKER_TIMEOUT_MS", 80_000),
+    // Supabase stops a request at 150s (free plan); leave room to send the result.
+    timeLimitMs: num("TIME_LIMIT_MS", 120_000),
+    draftGraceMs: num("DRAFT_GRACE_MS", 15_000),
   };
   return { cfg, ai, library };
 }
