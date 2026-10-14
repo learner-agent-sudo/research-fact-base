@@ -36,6 +36,7 @@ function must(name) {
 
 const results = [];
 const notes = [];
+const catalog = [];
 function record(ok, name, detail = "") {
   results.push({ ok, name, detail });
   console.log(`${ok === true ? "PASS" : ok === "warn" ? "WARN" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
@@ -172,6 +173,8 @@ if (!SERVICE_KEY) {
     return `answers drafted by ${free.generators.join(", ")}; checked by ${free.checker}`;
   });
 
+  await listFreeModels();
+
   if (ASK) {
     for (const { q, expectAnswer } of QUESTIONS) {
       await check(`Answer: "${q}"`, () => askQuestion(q, expectAnswer));
@@ -226,6 +229,30 @@ async function askQuestion(question, expectAnswer) {
   return `${seconds}s, confidence ${done.confidence}, ${final.removed.length} sentence(s) removed`;
 }
 
+/** OpenRouter's free models today (public list), to help choose them on the Settings page. */
+async function listFreeModels() {
+  try {
+    const { res, text } = await get("https://openrouter.ai/api/v1/models");
+    if (!res.ok) return;
+    const free = JSON.parse(text).data.filter(
+      (m) => m.id.endsWith(":free") || (Number(m.pricing?.prompt) === 0 && Number(m.pricing?.completion) === 0),
+    );
+    free.sort((a, b) => (b.created ?? 0) - (a.created ?? 0));
+    catalog.push(
+      `## Free models on OpenRouter right now (${free.length})`,
+      "",
+      "| Model | Name | Context | Added |",
+      "|---|---|---|---|",
+      ...free.map((m) =>
+        `| ${m.id} | ${(m.name ?? "").replace(/\|/g, "/")} | ${Math.round((m.context_length ?? 0) / 1000)}k | ${new Date((m.created ?? 0) * 1000).toISOString().slice(0, 10)} |`
+      ),
+      "",
+    );
+  } catch {
+    // informational only
+  }
+}
+
 // --- Report -----------------------------------------------------------------
 
 const failed = results.filter((r) => r.ok === false);
@@ -238,6 +265,7 @@ const summary = [
   ...results.map((r) => `| ${icon(r.ok)} | ${r.name} | ${r.detail.replace(/\|/g, "\\|").replace(/\n/g, " ")} |`),
   "",
   ...(notes.length ? ["## Answers from the live app", "", ...notes] : []),
+  ...catalog,
 ].join("\n");
 
 if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary + "\n");

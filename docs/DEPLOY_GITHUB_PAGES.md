@@ -149,5 +149,14 @@ OpenRouter accounts have a small daily request cap, and each question uses
   ingest job counts as activity, but GitHub disables scheduled workflows in
   public repos after 60 days without commits. If the site stops answering,
   check the project isn't paused (Supabase dashboard → Restore).
-- **150-second limit per request** on Supabase's free tier. The function's
-  timeouts (50s drafting, 80s checking) are set to fit inside it.
+- **150-second limit per request** on Supabase's free tier; past it the
+  request is cut off without a word. So every answer works to a 2-minute
+  deadline (`TIME_LIMIT_MS`, default `120000`): drafting may use just over
+  half of it (at most `GENERATOR_TIMEOUT_MS`, 50s), a slow drafting model is
+  dropped once another has answered and `DRAFT_GRACE_MS` (15s) has passed,
+  and the rest is kept for checking. If the models still aren't done, the
+  user is told it took too long and can try again or use Paid. The page
+  also gives up by itself if the service goes quiet for 45 seconds (it sends
+  a keep-alive every 10) or an answer passes 3 minutes, and has a Stop button.
+  Each answer's stage timings (never the question) are written to the
+  function's logs.
