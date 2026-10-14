@@ -236,6 +236,7 @@ interface CatalogModel {
   created?: number;
   context_length?: number;
   pricing?: { prompt?: string; completion?: string };
+  architecture?: { modality?: string; output_modalities?: string[] };
 }
 
 const CATALOG_TTL_MS = 60 * 60 * 1000;
@@ -268,21 +269,48 @@ const isFree = (m: CatalogModel) =>
   m.id.endsWith(":free") ||
   (m.pricing?.prompt !== undefined && Number(m.pricing.prompt) === 0 && Number(m.pricing.completion) === 0);
 
-// Free models to fall back on when the configured ones stop being free, best
-// families first. Small (<10B) and non-chat models are skipped.
-const FREE_FAMILIES = [/deepseek/, /qwen/, /llama-(4|3\.3)/, /gemini|gemma-3-27b/, /gpt-oss/, /kimi|glm|mistral/];
-const TOO_SMALL = /[-_:/](0\.\d+|1|1\.5|2|3|4|7|8|9)b\b/i;
-const NOT_CHAT = /[-_]vl\b|vision|embed|guard|audio|tts|image/i;
+// Models that can't answer a legal question in text: vision, embedding, safety
+// classifiers, audio, image and code models, and routers to random free models.
+const NOT_CHAT = /[-_]vl\b|vision|embed|guard|safety|audio|tts|image|[-_]code(r)?\b|^openrouter\//i;
+// Size words that mark a small model when the name gives no parameter count.
+const SMALL_NAME = /\b(nano|mini|small|tiny|lite|lightning|xs)\b/i;
+// Large model families whose names don't state their size.
+const LARGE_UNSIZED = /deepseek|kimi|glm|gemini/i;
 
+const writesText = (m: CatalogModel) => {
+  const out = m.architecture?.output_modalities;
+  if (out) return out.includes("text");
+  return !m.architecture?.modality || m.architecture.modality.endsWith("->text");
+};
+const isChat = (m: CatalogModel) => (m.context_length ?? 0) >= 16_000 && !NOT_CHAT.test(m.id) && writesText(m);
+
+/**
+ * Rough model size in billions of parameters, from names like "70b" or
+ * "120b-a12b" (a mixture of experts, counted between its total and active
+ * size); null when the name doesn't say.
+ */
+export function modelSize(id: string): number | null {
+  const m = id.match(/(?:^|[-_:/])(\d+(?:\.\d+)?)b(?:-a(\d+(?:\.\d+)?)b)?(?=$|[-_:.])/i);
+  if (m) return Math.round(Math.sqrt(Number(m[1]) * Number(m[2] ?? m[1])) * 10) / 10;
+  return LARGE_UNSIZED.test(id) ? 120 : null;
+}
+
+/**
+ * Free chat models, most capable first. Free models come and go, so this works
+ * from the model list alone: large models (25B+) by size, then models whose size
+ * isn't known (newest first), then mid-sized ones. Small models are left out:
+ * they can't be trusted to check legal answers.
+ */
 function rankedFree(models: CatalogModel[]): string[] {
-  const family = (id: string) => {
-    const i = FREE_FAMILIES.findIndex((re) => re.test(id));
-    return i === -1 ? FREE_FAMILIES.length : i;
-  };
+  const tier = (size: number | null) => (size === null ? 1 : size >= 25 ? 0 : 2);
   return models
-    .filter((m) => isFree(m) && (m.context_length ?? 0) >= 16_000 && !TOO_SMALL.test(m.id) && !NOT_CHAT.test(m.id))
-    .sort((a, b) => family(a.id) - family(b.id) || (b.created ?? 0) - (a.created ?? 0))
-    .map((m) => m.id);
+    .filter((m) => isFree(m) && isChat(m))
+    .map((m) => ({ m, size: modelSize(m.id) }))
+    .filter(({ m, size }) => (size === null ? !SMALL_NAME.test(m.id) : size >= 8))
+    .sort((a, b) =>
+      tier(a.size) - tier(b.size) || (b.size ?? 0) - (a.size ?? 0) || (b.m.created ?? 0) - (a.m.created ?? 0)
+    )
+    .map(({ m }) => m.id);
 }
 
 const unique = (ids: string[]) => [...new Set(ids)];
@@ -331,15 +359,14 @@ export async function modelOptions(
 ): Promise<{ free: ModelOption[]; paid: ModelOption[] } | null> {
   const models = await modelCatalog(cfg, signal);
   if (!models) return null;
-  const chat = (m: CatalogModel) => (m.context_length ?? 0) >= 16_000 && !NOT_CHAT.test(m.id);
   const option = (m: CatalogModel): ModelOption => ({ id: m.id, name: m.name || m.id, context: m.context_length });
   return {
     free: models
-      .filter((m) => isFree(m) && chat(m))
+      .filter((m) => isFree(m) && isChat(m))
       .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
       .map(option),
     paid: models
-      .filter((m) => !isFree(m) && chat(m) && PAID_PROVIDERS.test(m.id))
+      .filter((m) => !isFree(m) && isChat(m) && PAID_PROVIDERS.test(m.id))
       .sort((a, b) => a.id.localeCompare(b.id))
       .map(option),
   };
@@ -474,15 +501,18 @@ async function runChecker(
     },
   ];
 
-  // A fallback checker only gets a try if there's a sensible amount of time left.
-  // (The overall deadline arrives via `signal`; it isn't also used as this call's
-  // own timeout, so running out of time is always reported as such.)
+  // A fallback checker only gets a try if there's a sensible amount of time left,
+  // so all but the last checker may use at most 70% of it. (The last one runs to
+  // the overall deadline, which arrives via `signal`, so running out of time is
+  // always reported as such.)
   const minTry = Math.min(10_000, cfg.timeLimitMs / 10);
   const errors: string[] = [];
-  for (const model of models) {
+  for (const [i, model] of models.entries()) {
     if (errors.length && timeLeft() < minTry) break;
+    const last = i === models.length - 1;
+    const timeout = last ? cfg.checkerTimeoutMs : Math.min(cfg.checkerTimeoutMs, Math.floor(timeLeft() * 0.7));
     try {
-      const raw = await chatComplete(cfg, model, messages, cfg.checkerTimeoutMs, 0.1, signal);
+      const raw = await chatComplete(cfg, model, messages, timeout, 0.1, signal);
       return { ...parseCheckerOutput(raw, sources.length > 0), model };
     } catch (err) {
       if (signal?.aborted) throw err;

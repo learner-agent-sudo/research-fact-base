@@ -352,13 +352,71 @@ test("free tier switches to models that are still free when configured ones are 
   const meta = evs.find((e) => e.type === "meta") as { generators: string[]; checker: string };
   assert.deepEqual(meta.generators, [
     "deepseek/deepseek-chat-v3.1:free",
-    "qwen/qwen3-235b-a22b:free",
+    "openai/gpt-oss-120b:free",
     "google/gemini-2.0-flash-exp:free",
   ]);
   assert.equal(meta.checker, "deepseek/deepseek-chat-v3.1:free");
   assert.ok(evs.some((e) => e.type === "final"));
   const used = completions().map((c) => (c.body as { model: string }).model);
   assert.ok(used.every((m) => m.endsWith(":free")), `only free models called: ${used}`);
+});
+
+test("picks the most capable free models from OpenRouter's actual free list (October 2026)", async () => {
+  const text = { modality: "text->text", output_modalities: ["text"] };
+  const free = (id: string, created: number, extra: object = {}) =>
+    ({ id, pricing: FREE, context_length: 262144, created, architecture: text, ...extra });
+  scenario.catalog = [
+    free("dots-studio/dots-3-note-preview:free", 17),
+    free("liquid/lfm-2.5-2.6b:free", 16),
+    free("nvidia/nemotron-3.5-lightning:free", 16),
+    free("thinkingmachines/inkling-small:free", 15),
+    free("poolside/laguna-s-2.1:free", 14),
+    free("thinkingmachines/inkling:free", 13),
+    free("poolside/laguna-xs-2.1:free", 12),
+    free("cohere/north-mini-code:free", 11),
+    free("nvidia/nemotron-3.5-content-safety:free", 10),
+    free("nvidia/nemotron-3-ultra-550b-a55b:free", 10),
+    free("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", 9),
+    free("google/gemma-4-26b-a4b-it:free", 8),
+    free("google/gemma-4-31b-it:free", 8),
+    free("google/lyria-3-pro-preview", 7, { architecture: { modality: "text->audio", output_modalities: ["audio"] } }),
+    free("nvidia/nemotron-3-super-120b-a12b:free", 6),
+    free("openrouter/free", 5),
+  ];
+  const evs = await events(await chat({ messages: [{ role: "user", content: "duty of good faith?" }] }));
+  const meta = evs.find((e) => e.type === "meta") as { generators: string[]; checker: string };
+  assert.deepEqual(meta.generators, [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-31b-it:free",
+  ]);
+  assert.equal(meta.checker, "nvidia/nemotron-3-ultra-550b-a55b:free");
+
+  // The Settings page offers every free model that writes text, but not music
+  // generators, safety classifiers, code models or random routers.
+  const options = (await (await get("settings")).json()).models.options.free.map((o: { id: string }) => o.id);
+  assert.ok(options.includes("liquid/lfm-2.5-2.6b:free"));
+  for (const id of ["google/lyria-3-pro-preview", "nvidia/nemotron-3.5-content-safety:free", "cohere/north-mini-code:free", "openrouter/free"]) {
+    assert.ok(!options.includes(id), `${id} is not offered`);
+  }
+});
+
+test("model sizes are read from names, including mixtures of experts", async () => {
+  const { modelSize } = await import("./pipeline.ts");
+  assert.equal(modelSize("meta-llama/llama-3.3-70b-instruct:free"), 70);
+  assert.equal(modelSize("liquid/lfm-2.5-2.6b:free"), 2.6);
+  assert.equal(modelSize("qwen/qwen3-235b-a22b:free"), 71.9);
+  assert.equal(modelSize("google/gemma-4-31b-it:free"), 31);
+  assert.equal(modelSize("deepseek/deepseek-chat-v3.1:free"), 120);
+  assert.equal(modelSize("thinkingmachines/inkling:free"), null);
+});
+
+test("a slow first checker leaves time for the next one", async () => {
+  ENV.TIME_LIMIT_MS = "2000";
+  scenario.delayMs = (model, role) => (role === "check" && model.startsWith("meta-llama/") ? 60_000 : 0);
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const final = evs.find((e) => e.type === "final") as { checker: string };
+  assert.equal(final.checker, "deepseek/deepseek-chat-v3-0324:free");
 });
 
 test("configured free models that are still free keep their place", async () => {
