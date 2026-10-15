@@ -473,8 +473,13 @@ export async function resolveModels(cfg: Config, tier: Tier, signal?: AbortSigna
     return {
       // Drafting count is set by cfg.fanout (runPipeline).
       generators: unique([...configured.generators.filter(usable), ...[...lite, ...flash].slice(0, 1), ...openrouter]),
-      checker: unique([...configured.checker.filter(usable), ...[...flash, ...lite].slice(0, 3), ...openrouter])
-        .slice(0, 5),
+      // Each Gemini model has its own allowance: two Flash models, then Flash-Lite.
+      checker: unique([
+        ...configured.checker.filter(usable),
+        ...flash.slice(0, 2),
+        ...lite.slice(0, 1),
+        ...openrouter,
+      ]).slice(0, 5),
     };
   }
 
@@ -645,7 +650,7 @@ async function runChecker(
   drafts: Draft[],
   timeLeft: () => number,
   signal?: AbortSignal,
-): Promise<{ answer: string; meta: CheckerMeta; model: string }> {
+): Promise<{ answer: string; meta: CheckerMeta; model: string; errors: string[] }> {
   const candidates =
     drafts
       .filter((d) => d.content)
@@ -673,7 +678,7 @@ async function runChecker(
     const timeout = last ? cfg.checkerTimeoutMs : Math.min(cfg.checkerTimeoutMs, Math.floor(timeLeft() * 0.7));
     try {
       const raw = await chatComplete(cfg, model, messages, timeout, 0.1, signal);
-      return { ...parseCheckerOutput(raw, sources.length > 0), model };
+      return { ...parseCheckerOutput(raw, sources.length > 0), model, errors };
     } catch (err) {
       if (signal?.aborted) throw err;
       errors.push(String(err instanceof Error ? err.message : err));
@@ -796,7 +801,7 @@ export async function runPipeline(
     emit({ type: "stage", stage: "checking" });
     const checked = await runChecker(cfg, set.checker, question, history, sources, drafts, timeLeft, budget);
     lap("checked");
-    // Timings and model names only (never the question), for diagnosing slow answers in the logs.
+    // Timings, model names and model errors only (never the question), for diagnosing slow answers.
     console.log(JSON.stringify({
       event: "answer",
       tier,
@@ -804,6 +809,7 @@ export async function runPipeline(
       ms: timings,
       drafts: Object.fromEntries(drafts.map((d) => [d.model, !!d.content])),
       checker: checked.model,
+      errors: [...drafts.map((d) => d.error ?? ""), ...checked.errors].filter(Boolean).map((e) => e.slice(0, 240)),
     }));
 
     emit({ type: "stage", stage: "verifying" });

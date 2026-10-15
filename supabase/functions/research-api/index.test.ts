@@ -554,9 +554,31 @@ test("a used-up Gemini allowance moves on to the next model at once", async () =
   const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
   const final = evs.find((e) => e.type === "final") as { checker: string };
   assert.equal(final.checker, "google-ai-studio/gemini-2.5-flash");
+  const meta = evs.find((e) => e.type === "meta") as { checker: string };
+  assert.equal(meta.checker, "google-ai-studio/gemini-3.5-flash");
   // Gemini 2.5 turns thinking off rather than down.
   const used = geminiCalls().find((c) => c.model === "gemini-2.5-flash")!;
   assert.deepEqual(used.body.generationConfig.thinkingConfig, { thinkingBudget: 0 });
+});
+
+test("when the Flash models' allowances are used up, Flash-Lite checks before slower OpenRouter models", async () => {
+  scenario.gemini = [...GEMINI_LIST, gem("gemini-3.4-flash", "Gemini 3.4 Flash")];
+  scenario.catalog = OPENROUTER_FREE;
+  scenario.geminiSpent = ["gemini-3.5-flash", "gemini-3.4-flash"];
+  const logged: string[] = [];
+  const log = console.log;
+  console.log = (line: string) => logged.push(line);
+  try {
+    const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+    assert.equal((evs.find((e) => e.type === "final") as { checker: string }).checker, "google-ai-studio/gemini-3.5-flash-lite");
+  } finally {
+    console.log = log;
+  }
+  // The log says why each model wasn't used, without the question.
+  const entry = JSON.parse(logged.find((l) => l.includes('"event":"answer"'))!);
+  assert.equal(entry.errors.length, 2);
+  assert.match(entry.errors[0], /gemini-3\.5-flash: HTTP 429 .*quota/);
+  assert.ok(!logged.join("").includes('"q"'));
 });
 
 test("a Gemini model that won't take the thinking setting is asked again without it", async () => {
