@@ -10,8 +10,8 @@ No paid plan, no credit card, no custom domain.
              research-api                  requires a signed-in user on ALLOWED_EMAILS
                   │
                   ├─► Supabase Postgres    your documents + embeddings (pgvector)
-                  ├─► Gemini               embeds the question
-                  └─► OpenRouter           drafting + checker models
+                  ├─► Gemini               embeds the question; fast free drafting + checking
+                  └─► OpenRouter           more drafting models; paid models
 
   GitHub Actions ──► "Ingest Drive corpus" (daily) loads Drive files into Postgres
 ```
@@ -127,21 +127,33 @@ Settings saved on the Settings page take precedence over these.
 
 | Secret | Default | Effect |
 |---|---|---|
-| `FREE_GENERATORS` | llama-3.3-70b, deepseek-v3, qwen-2.5-72b (`:free`) | drafting ensemble |
-| `FREE_CHECKER` | llama-3.3-70b, deepseek-v3 (`:free`) | tried in order |
+| `FREE_GENERATORS` | automatic | preferred drafting models, comma-separated |
+| `FREE_CHECKER` | automatic | preferred checking models, tried in order |
 | `PAID_GENERATORS` / `PAID_CHECKER` | Claude Sonnet 4.5 → 4 → 3.7 | the "Claude (paid)" tier |
 | `FANOUT` | `3` | drafting models per question |
 | `RETRIEVAL_TOP_K` | `8` | passages searched per question |
 | `MIN_SIMILARITY` | `0` (off) | drop weak matches; the app abstains if none remain |
 
-Free OpenRouter models change often, so the function checks OpenRouter's live
-model list (cached for an hour): configured models that are still free are
-used first, and any that have been withdrawn are replaced by the best models
-that are free right now. The paid tier likewise falls back to the newest
-Claude Sonnet if a configured slug disappears. Set `FREE_*` only to change
-the preference order. Note that free
-OpenRouter accounts have a small daily request cap, and each question uses
-`FANOUT + 1` requests.
+Free answers are drafted by one of Google's Gemini models plus OpenRouter's
+largest free models, and checked by Gemini Flash. Gemini is called directly
+with the Gemini key the app already uses for search; its free Flash models
+answer in seconds, where free OpenRouter models often take a minute or more.
+If a Gemini model's free daily allowance is used up, Google refuses at once
+and the next model is tried: other Gemini models, then OpenRouter's.
+
+Free models change often, so the function reads Google's and OpenRouter's
+live model lists (cached for an hour) and picks from what is available:
+newest Gemini Flash to check, Flash-Lite to draft (it has the largest free
+allowance), and OpenRouter's free models by size. Models chosen on the
+Settings page (or by `FREE_*`) are used first while they're still free. The
+paid tier likewise falls back to the newest Claude Sonnet if a configured
+slug disappears. Each question uses `FANOUT + 1` requests.
+
+On Google's free tier, Google may use what is sent to Gemini to improve its
+products — the same terms that already apply to your documents' text when the
+loader sends it to Gemini to make them searchable. If you turn on billing for
+that Google key, these calls are billed (Flash models cost a fraction of a
+cent per question).
 
 ## Limits worth knowing
 
@@ -149,12 +161,15 @@ OpenRouter accounts have a small daily request cap, and each question uses
   ingest job counts as activity, but GitHub disables scheduled workflows in
   public repos after 60 days without commits. If the site stops answering,
   check the project isn't paused (Supabase dashboard → Restore).
-- **150-second limit per request** on Supabase's free tier; past it the
-  request is cut off without a word. So every answer works to a 2-minute
-  deadline (`TIME_LIMIT_MS`, default `120000`): drafting may use just over
-  half of it (at most `GENERATOR_TIMEOUT_MS`, 50s), a slow drafting model is
-  dropped once another has answered and `DRAFT_GRACE_MS` (15s) has passed,
-  and the rest is kept for checking. If the models still aren't done, the
+- **150-second limit per server worker** on Supabase's free tier. A worker
+  starts with the first request and serves every request that arrives while
+  it runs, so a question asked just after opening a page may have well under
+  150 seconds left; when the time is up the worker is stopped without a word.
+  So every answer works to a deadline: 2 minutes (`TIME_LIMIT_MS`, default
+  `120000`) or the worker's remaining time less 8 seconds, whichever is
+  sooner. Drafting may use just over half of it (at most
+  `GENERATOR_TIMEOUT_MS`, 50s); once one draft is in, the others get about as
+  long again (5–15s, `DRAFT_GRACE_MS`), and the rest is kept for checking. If the models still aren't done, the
   user is told it took too long and can try again or use Paid. The page
   also gives up by itself if the service goes quiet for 45 seconds (it sends
   a keep-alive every 10) or an answer passes 3 minutes, and has a Stop button.

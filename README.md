@@ -4,8 +4,8 @@ A legal research assistant that answers **only from your own documents** — and
 checks its own work in code before you see anything.
 
 1. **Search** your Google Drive corpus (semantic search over embedded passages).
-2. **Draft** with an ensemble of models (free models via OpenRouter, or Claude
-   on the paid tier), told to use only those passages.
+2. **Draft** with an ensemble of models (free: Google's Gemini plus free
+   models via OpenRouter; paid: Claude), told to use only those passages.
 3. **Check** with a stronger model that consolidates the drafts and drops
    unsupported claims.
 4. **Verify in code** — deterministic checks remove any sentence that:

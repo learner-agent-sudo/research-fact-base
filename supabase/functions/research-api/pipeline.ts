@@ -4,7 +4,8 @@
  *
  *   1. retrieve  - embed the question (Gemini) and search the document corpus
  *                  (pgvector `match_chunks`). Closed corpus: no web search.
- *   2. draft     - fan the question out to a model ensemble via OpenRouter.
+ *   2. draft     - fan the question out to a model ensemble (OpenRouter, and
+ *                  for free answers Google's Gemini API, which is much faster).
  *   3. check     - a checker model consolidates the drafts against the sources.
  *   4. ground    - deterministic code checks (grounding.ts) remove any sentence
  *                  citing authority or quoting text not found in the sources.
@@ -77,9 +78,12 @@ export interface Config {
   appUrl: string;
   generatorTimeoutMs: number;
   checkerTimeoutMs: number;
-  /** The whole answer must be sent within this; Supabase stops a request at 150s (free plan). */
+  /** The whole answer must be sent within this; Supabase stops a worker 150s after it starts (free plan). */
   timeLimitMs: number;
-  /** Once one draft is in, how much longer to wait for the other drafting models. */
+  /**
+   * Once one draft is in, the longest to wait for the other drafting models
+   * (less if the first was quick: see runGenerators).
+   */
   draftGraceMs: number;
 }
 
@@ -225,7 +229,7 @@ export async function retrieve(cfg: Config, query: string, signal?: AbortSignal)
 }
 
 // ---------------------------------------------------------------------------
-// 2-3. Models (OpenRouter)
+// 2-3. Models (OpenRouter, and Gemini directly)
 // ---------------------------------------------------------------------------
 
 type Msg = { role: string; content: string };
@@ -242,9 +246,10 @@ interface CatalogModel {
 const CATALOG_TTL_MS = 60 * 60 * 1000;
 let catalog: { at: number; models: CatalogModel[] } | null = null;
 
-/** Forget the cached OpenRouter model list (tests). */
+/** Forget the cached model lists (tests). */
 export function clearModelCatalog() {
   catalog = null;
+  geminiCache = null;
 }
 
 /** OpenRouter's public model list, cached for an hour; null if it can't be fetched. */
@@ -315,26 +320,171 @@ function rankedFree(models: CatalogModel[]): string[] {
 
 const unique = (ids: string[]) => [...new Set(ids)];
 
+// Free models used only if OpenRouter's model list can't be fetched.
+const OFFLINE_FREE = [
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "deepseek/deepseek-chat-v3-0324:free",
+  "qwen/qwen-2.5-72b-instruct:free",
+];
+
+// ---------------------------------------------------------------------------
+// Gemini, called directly with the Gemini key the app already has for search.
+// Google's free Flash models answer in seconds, where free OpenRouter models
+// can take minutes. Model names change, so they are read from Google's list.
+// ---------------------------------------------------------------------------
+
+/** Model ids starting with this go to Google's Gemini API rather than OpenRouter. */
+export const GEMINI_PREFIX = "google-ai-studio/";
+const GEMINI_API = "https://generativelanguage.googleapis.com/v1beta";
+
+interface GeminiModel {
+  id: string; // with GEMINI_PREFIX
+  name: string;
+  lite: boolean;
+}
+
+let geminiCache: { at: number; models: GeminiModel[] } | null = null;
+
+const GEMINI_FLASH = /^gemini-(\d+(?:\.\d+)?)-flash(-lite)?(?:-(?:preview|exp)[\w-]*)?$/;
+const GEMINI_NOT_TEXT = /tts|image|audio|live|thinking|robotics|computer/;
+
+/** Gemini Flash models, newest first, stable releases before previews; Flash-Lite last. */
+export function rankedGemini(
+  models: { name?: string; displayName?: string; supportedGenerationMethods?: string[] }[],
+): GeminiModel[] {
+  return models
+    .map((m) => ({ m, id: String(m.name ?? "").replace(/^models\//, "") }))
+    .map(({ m, id }) => ({ m, id, match: id.match(GEMINI_FLASH) }))
+    .filter(({ m, id, match }) =>
+      match && !GEMINI_NOT_TEXT.test(id) && (m.supportedGenerationMethods ?? []).includes("generateContent")
+    )
+    .map(({ m, id, match }) => ({
+      id,
+      name: m.displayName || id,
+      version: Number(match![1]),
+      lite: Boolean(match![2]),
+      preview: /-(preview|exp)/.test(id),
+    }))
+    .sort((a, b) =>
+      Number(a.lite) - Number(b.lite) || b.version - a.version || Number(a.preview) - Number(b.preview) ||
+      a.id.localeCompare(b.id)
+    )
+    .map(({ id, name, lite }) => ({ id: GEMINI_PREFIX + id, name, lite }));
+}
+
+/** The Gemini Flash models this key can use (cached for an hour); [] if they can't be listed. */
+async function geminiModels(cfg: Config, signal?: AbortSignal): Promise<GeminiModel[]> {
+  if (!cfg.geminiKey) return [];
+  if (geminiCache && Date.now() - geminiCache.at < CATALOG_TTL_MS) return geminiCache.models;
+  try {
+    const res = await fetch(`${GEMINI_API}/models?pageSize=1000`, {
+      headers: { "x-goog-api-key": cfg.geminiKey },
+      signal: withTimeout(signal, 10_000),
+    });
+    const data = res.ok ? await res.json() : null;
+    if (!res.ok) await res.body?.cancel();
+    if (!Array.isArray(data?.models)) return geminiCache?.models ?? [];
+    geminiCache = { at: Date.now(), models: rankedGemini(data.models) };
+    return geminiCache.models;
+  } catch {
+    return geminiCache?.models ?? [];
+  }
+}
+
+/** Thinking makes answers slower: keep it low (Gemini 3 and later) or off (2.5). */
+function geminiThinking(id: string): Record<string, unknown> | undefined {
+  const version = Number(id.match(/^gemini-(\d+(?:\.\d+)?)/)?.[1] ?? 0);
+  if (version >= 3) return { thinkingLevel: "low" };
+  if (version >= 2.5) return { thinkingBudget: 0 };
+  return undefined;
+}
+
+async function geminiComplete(
+  cfg: Config,
+  model: string,
+  messages: Msg[],
+  timeoutMs: number,
+  temperature: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const id = model.slice(GEMINI_PREFIX.length);
+  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
+  const contents = messages
+    .filter((m) => m.role !== "system")
+    .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+  const deadline = withTimeout(signal, timeoutMs);
+  const send = (thinking?: Record<string, unknown>) =>
+    fetch(`${GEMINI_API}/models/${id}:generateContent`, {
+      method: "POST",
+      headers: { "x-goog-api-key": cfg.geminiKey!, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents,
+        generationConfig: { temperature, ...(thinking ? { thinkingConfig: thinking } : {}) },
+      }),
+      signal: deadline,
+    });
+
+  const thinking = geminiThinking(id);
+  let res = await send(thinking);
+  if (res.status === 400 && thinking) {
+    const text = await errorText(res);
+    if (!/thinking/i.test(text)) throw new Error(`${model}: HTTP 400 ${text}`);
+    res = await send(); // a model that doesn't take this thinking setting
+  }
+  if (!res.ok) throw new Error(`${model}: HTTP ${res.status} ${await errorText(res)}`);
+  const data = await res.json();
+  const candidate = data?.candidates?.[0];
+  const parts: { text?: unknown; thought?: unknown }[] = Array.isArray(candidate?.content?.parts)
+    ? candidate.content.parts
+    : [];
+  const content = parts.filter((p) => !p.thought && typeof p.text === "string").map((p) => p.text).join("");
+  if (!content.trim()) {
+    const why = candidate?.finishReason ?? data?.promptFeedback?.blockReason;
+    throw new Error(`${model}: empty response${why ? ` (${why})` : ""}`);
+  }
+  return content;
+}
+
 /**
- * The models to use for a tier, checked against OpenRouter's live list:
- * configured models that are still offered (and, for the free tier, still
- * free) come first, then the best other candidates. Free slugs come and go,
- * so this keeps the app answering without a redeploy. If the list can't be
- * fetched, the configured models are used as-is.
+ * The models to use for a tier, checked against the live model lists:
+ * models chosen on the Settings page (or by secrets) that are still offered,
+ * and for the free tier still free, come first, then the best other
+ * candidates. Free slugs come and go, so this keeps the app answering without
+ * a redeploy.
+ *
+ * Free answers draft with one Gemini model (Flash-Lite where available: fast,
+ * with the largest free allowance) alongside OpenRouter models, and are
+ * checked by Gemini Flash, falling back to other Gemini models, then
+ * OpenRouter's. A used-up Gemini allowance is refused at once, so falling
+ * back costs little time.
  */
 export async function resolveModels(cfg: Config, tier: Tier, signal?: AbortSignal): Promise<ModelSet> {
   const configured = cfg.models[tier];
+  if (tier === "free") {
+    const [models, gemini] = await Promise.all([modelCatalog(cfg, signal), geminiModels(cfg, signal)]);
+    const free = new Set(models?.filter(isFree).map((m) => m.id));
+    const offered = new Set(gemini.map((g) => g.id));
+    // If OpenRouter's list can't be fetched, chosen OpenRouter models are used as they are.
+    const usable = (id: string) => id.startsWith(GEMINI_PREFIX) ? offered.has(id) : !models || free.has(id);
+    const openrouter = models ? rankedFree(models) : OFFLINE_FREE;
+    const lite = gemini.filter((g) => g.lite).map((g) => g.id);
+    const flash = gemini.filter((g) => !g.lite).map((g) => g.id);
+    return {
+      // Drafting count is set by cfg.fanout (runPipeline).
+      generators: unique([...configured.generators.filter(usable), ...[...lite, ...flash].slice(0, 1), ...openrouter]),
+      checker: unique([...configured.checker.filter(usable), ...[...flash, ...lite].slice(0, 3), ...openrouter])
+        .slice(0, 5),
+    };
+  }
+
   const models = await modelCatalog(cfg, signal);
   if (!models) return configured;
-
-  const offered = new Set(models.filter((m) => (tier === "free" ? isFree(m) : !isFree(m))).map((m) => m.id));
-  const fallbacks =
-    tier === "free"
-      ? rankedFree(models)
-      : models
-        .filter((m) => /^anthropic\/claude-[\w.-]*sonnet/.test(m.id) && !isFree(m))
-        .sort((a, b) => (b.created ?? 0) - (a.created ?? 0))
-        .map((m) => m.id);
+  const offered = new Set(models.filter((m) => !isFree(m)).map((m) => m.id));
+  const fallbacks = models
+    .filter((m) => /^anthropic\/claude-[\w.-]*sonnet/.test(m.id) && !isFree(m))
+    .sort((a, b) => (b.created ?? 0) - (a.created ?? 0))
+    .map((m) => m.id);
   const pick = (ids: string[]) => unique([...ids.filter((id) => offered.has(id)), ...fallbacks]);
 
   // Never more drafting models than configured (the paid tier drafts with one).
@@ -352,20 +502,26 @@ export interface ModelOption {
 
 const PAID_PROVIDERS = /^(anthropic|openai|google|x-ai|deepseek|mistralai|qwen|meta-llama|moonshotai)\//;
 
-/** Choices for the Settings page: chat models free right now, and paid ones from major providers. */
+/**
+ * Choices for the Settings page: free models (Gemini's first, then OpenRouter
+ * chat models that are free right now), and paid ones from major providers.
+ */
 export async function modelOptions(
   cfg: Config,
   signal?: AbortSignal,
 ): Promise<{ free: ModelOption[]; paid: ModelOption[] } | null> {
-  const models = await modelCatalog(cfg, signal);
-  if (!models) return null;
+  const [models, gemini] = await Promise.all([modelCatalog(cfg, signal), geminiModels(cfg, signal)]);
+  if (!models && !gemini.length) return null;
   const option = (m: CatalogModel): ModelOption => ({ id: m.id, name: m.name || m.id, context: m.context_length });
   return {
-    free: models
-      .filter((m) => isFree(m) && isChat(m))
-      .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
-      .map(option),
-    paid: models
+    free: [
+      ...gemini.map((g) => ({ id: g.id, name: `Google: ${g.name} (direct, with your Gemini key)` })),
+      ...(models ?? [])
+        .filter((m) => isFree(m) && isChat(m))
+        .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
+        .map(option),
+    ],
+    paid: (models ?? [])
       .filter((m) => !isFree(m) && isChat(m) && PAID_PROVIDERS.test(m.id))
       .sort((a, b) => a.id.localeCompare(b.id))
       .map(option),
@@ -380,6 +536,7 @@ export async function chatComplete(
   temperature: number,
   signal?: AbortSignal,
 ): Promise<string> {
+  if (model.startsWith(GEMINI_PREFIX)) return await geminiComplete(cfg, model, messages, timeoutMs, temperature, signal);
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -420,13 +577,16 @@ async function runGenerators(
     { role: "user", content: `SOURCES:\n${formatSources(sources)}\n\nQUESTION:\n${question}` },
   ];
   // Once one draft is in, wait only a little longer for the others: one slow
-  // free model shouldn't hold up the whole answer.
+  // free model shouldn't hold up the whole answer. After a quick first draft,
+  // wait about as long again (at least a third of the full grace period).
   const enough = new AbortController();
+  const started = Date.now();
   let grace: ReturnType<typeof setTimeout> | undefined;
   const settled = await Promise.allSettled(
     models.map(async (m) => {
       const content = await chatComplete(cfg, m, messages, timeoutMs, 0.2, anySignal(signal, enough.signal));
-      grace ??= setTimeout(() => enough.abort(), cfg.draftGraceMs);
+      const wait = Math.min(cfg.draftGraceMs, Math.max(cfg.draftGraceMs / 3, Date.now() - started));
+      grace ??= setTimeout(() => enough.abort(), wait);
       return content;
     }),
   );
@@ -503,12 +663,12 @@ async function runChecker(
 
   // A fallback checker only gets a try if there's a sensible amount of time left,
   // so all but the last checker may use at most 70% of it. (The last one runs to
-  // the overall deadline, which arrives via `signal`, so running out of time is
-  // always reported as such.)
+  // the overall deadline, which arrives via `signal`.) Running out of time is
+  // always reported as such.
   const minTry = Math.min(10_000, cfg.timeLimitMs / 10);
   const errors: string[] = [];
   for (const [i, model] of models.entries()) {
-    if (errors.length && timeLeft() < minTry) break;
+    if (errors.length && timeLeft() < minTry) throw new Error(tooSlowMessage(cfg));
     const last = i === models.length - 1;
     const timeout = last ? cfg.checkerTimeoutMs : Math.min(cfg.checkerTimeoutMs, Math.floor(timeLeft() * 0.7));
     try {
@@ -521,7 +681,7 @@ async function runChecker(
   }
   const draftErrors = drafts.filter((d) => d.error).map((d) => d.error!);
   throw new Error(
-    "The AI models didn't respond. Free OpenRouter models are sometimes unavailable or rate-limited \u2014 " +
+    "The AI models didn't respond. Free models are sometimes unavailable or out of their daily allowance \u2014 " +
       "try again shortly, or switch to Paid for this question.\n\nDetails: " +
       [...errors, ...draftErrors].join(" | ").slice(0, 600),
   );
@@ -529,8 +689,9 @@ async function runChecker(
 
 /** Shown when the models are too slow to answer within the time limit. */
 export function tooSlowMessage(cfg: Config): string {
+  const seconds = Math.round(cfg.timeLimitMs / 1000);
   return (
-    `The AI models didn't finish within ${Math.round(cfg.timeLimitMs / 1000)} seconds, so I stopped waiting. ` +
+    `The AI models didn't finish within ${seconds} second${seconds === 1 ? "" : "s"}, so I stopped waiting. ` +
     "Free models are sometimes slow or busy \u2014 try again in a minute, or switch to Paid for this question."
   );
 }
@@ -636,7 +797,14 @@ export async function runPipeline(
     const checked = await runChecker(cfg, set.checker, question, history, sources, drafts, timeLeft, budget);
     lap("checked");
     // Timings and model names only (never the question), for diagnosing slow answers in the logs.
-    console.log(JSON.stringify({ event: "answer", tier, ms: timings, drafts: drafts.map((d) => !!d.content), checker: checked.model }));
+    console.log(JSON.stringify({
+      event: "answer",
+      tier,
+      limit: cfg.timeLimitMs,
+      ms: timings,
+      drafts: Object.fromEntries(drafts.map((d) => [d.model, !!d.content])),
+      checker: checked.model,
+    }));
 
     emit({ type: "stage", stage: "verifying" });
     const report = enforceGrounding(checked.answer, sources, checked.meta.quotes);
@@ -653,7 +821,13 @@ export async function runPipeline(
     emit({ type: "done", confidence, unsupported });
   } catch (err) {
     lap("failed");
-    console.log(JSON.stringify({ event: "answer_failed", tier, ms: timings, outOfTime: budget.aborted && !signal?.aborted }));
+    console.log(JSON.stringify({
+      event: "answer_failed",
+      tier,
+      limit: cfg.timeLimitMs,
+      ms: timings,
+      outOfTime: budget.aborted && !signal?.aborted,
+    }));
     throw budget.aborted && !signal?.aborted ? new Error(tooSlowMessage(cfg)) : err;
   }
 }

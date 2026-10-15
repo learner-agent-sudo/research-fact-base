@@ -241,6 +241,35 @@ test.describe("settings", () => {
     await expectNoHorizontalScroll(page);
   });
 
+  test("Google's Gemini models are used for free answers when the Gemini key allows", async ({ page }) => {
+    const gem = (id: string, displayName: string) =>
+      ({ name: `models/${id}`, displayName, supportedGenerationMethods: ["generateContent"] });
+    world.gemini = [gem("gemini-3.5-flash", "Gemini 3.5 Flash"), gem("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite")];
+    world.catalog = [
+      { id: "deepseek/deepseek-chat-v3.1:free", name: "DeepSeek V3.1 (free)", pricing: FREE, context_length: 163840 },
+    ];
+    await signIn(page);
+    await nav(page, "Settings").click();
+    await expect(
+      page.getByText(/Currently drafting with google-ai-studio\/gemini-3\.5-flash-lite, deepseek\/deepseek-chat-v3\.1:free; checking with google-ai-studio\/gemini-3\.5-flash\./),
+    ).toBeVisible();
+    await page.getByText("Let me choose").click();
+    await expect(page.getByLabel("Checking model").locator("option").nth(1)).toHaveText(
+      "Google: Gemini 3.5 Flash (direct, with your Gemini key)",
+    );
+
+    await nav(page, "Ask").click();
+    await ask(page);
+    await expect(page.locator(".answer")).toContainText(ANSWER);
+    await expect(page.getByText("checked by google-ai-studio/gemini-3.5-flash")).toBeVisible();
+    expect(world.modelCalls).toEqual([
+      "google-ai-studio/gemini-3.5-flash-lite",
+      "deepseek/deepseek-chat-v3.1:free",
+      "google-ai-studio/gemini-3.5-flash",
+    ]);
+    expect(world.modelKeys[0]).toBe("gemini-test-key");
+  });
+
   test("the default answer mode chosen in Settings is used on the Ask page", async ({ page }) => {
     await signIn(page);
     await expect(page.getByRole("button", { name: "Free", pressed: true })).toBeVisible();

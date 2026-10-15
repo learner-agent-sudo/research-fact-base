@@ -85,18 +85,25 @@ const supabaseUrl = () => env("SUPABASE_URL") ?? "";
 const serviceKey = () => env("SUPABASE_SERVICE_ROLE_KEY") ?? firstKey("SUPABASE_SECRET_KEYS") ?? "";
 const publicKey = () => env("SUPABASE_ANON_KEY") ?? firstKey("SUPABASE_PUBLISHABLE_KEYS") ?? serviceKey();
 
-// Free OpenRouter slugs come and go: these are preferences, checked against
-// OpenRouter's live list at question time (pipeline.ts resolveModels).
-const DEFAULT_FREE_GENERATORS = [
-  "meta-llama/llama-3.3-70b-instruct:free",
-  "deepseek/deepseek-chat-v3-0324:free",
-  "qwen/qwen-2.5-72b-instruct:free",
-];
-const DEFAULT_FREE_CHECKER = ["meta-llama/llama-3.3-70b-instruct:free", "deepseek/deepseek-chat-v3-0324:free"];
+// Free models are chosen automatically from the live model lists unless chosen
+// on the Settings page or by FREE_GENERATORS / FREE_CHECKER (pipeline.ts resolveModels).
 const DEFAULT_PAID_GENERATORS = ["anthropic/claude-sonnet-4.5"];
 const DEFAULT_PAID_CHECKER = ["anthropic/claude-sonnet-4.5", "anthropic/claude-sonnet-4", "anthropic/claude-3.7-sonnet"];
 
 const unique = (ids: string[]) => [...new Set(ids)];
+
+/**
+ * Supabase stops a worker 150s (free plan) after it starts, and one worker
+ * serves every request that arrives meanwhile — so a question asked just after
+ * opening a page can have much less than 150s left. Answers must be sent
+ * before then, with a few seconds to spare.
+ */
+export const WORKER_STARTED = Date.now();
+
+function timeLimitMs(): number {
+  const workerLeft = WORKER_STARTED + num("WORKER_LIMIT_MS", 150_000) - 8_000 - Date.now();
+  return Math.max(1_000, Math.min(num("TIME_LIMIT_MS", 120_000), workerLeft));
+}
 
 type KeySource = "settings" | "supabase" | "missing";
 
@@ -124,7 +131,6 @@ async function load(): Promise<{ cfg: Config; ai: AiSettings; library: LibrarySt
     effectiveKey("gemini"),
   ]);
   const ai = saved ?? defaultAi();
-  const freeChecker = list("FREE_CHECKER", DEFAULT_FREE_CHECKER);
   const paidChecker = list("PAID_CHECKER", DEFAULT_PAID_CHECKER);
   const cfg: Config = {
     supabaseUrl: supabaseUrl(),
@@ -139,8 +145,8 @@ async function load(): Promise<{ cfg: Config; ai: AiSettings; library: LibrarySt
     fanout: ai.fanout,
     models: {
       free: {
-        generators: unique([...ai.freeModels, ...list("FREE_GENERATORS", DEFAULT_FREE_GENERATORS)]),
-        checker: unique([...(ai.freeChecker ? [ai.freeChecker] : []), ...freeChecker]),
+        generators: unique([...ai.freeModels, ...list("FREE_GENERATORS", [])]),
+        checker: unique([...(ai.freeChecker ? [ai.freeChecker] : []), ...list("FREE_CHECKER", [])]),
       },
       paid: {
         generators: ai.paidModel ? [ai.paidModel] : list("PAID_GENERATORS", DEFAULT_PAID_GENERATORS),
@@ -150,8 +156,7 @@ async function load(): Promise<{ cfg: Config; ai: AiSettings; library: LibrarySt
     appUrl: env("APP_URL") ?? "https://learner-agent-sudo.github.io/research-fact-base/",
     generatorTimeoutMs: num("GENERATOR_TIMEOUT_MS", 50_000),
     checkerTimeoutMs: num("CHECKER_TIMEOUT_MS", 80_000),
-    // Supabase stops a request at 150s (free plan); leave room to send the result.
-    timeLimitMs: num("TIME_LIMIT_MS", 120_000),
+    timeLimitMs: timeLimitMs(),
     draftGraceMs: num("DRAFT_GRACE_MS", 15_000),
   };
   return { cfg, ai, library };

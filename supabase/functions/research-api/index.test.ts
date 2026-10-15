@@ -43,6 +43,12 @@ interface Scenario {
   delayMs?: (model: string, role: "draft" | "check") => number;
   /** OpenRouter's model list; unset = the list can't be fetched. */
   catalog?: { id: string; created?: number; context_length?: number; pricing?: { prompt: string; completion: string } }[];
+  /** Google's Gemini model list; unset = the list can't be fetched. */
+  gemini?: { name: string; displayName?: string; supportedGenerationMethods: string[] }[];
+  /** Gemini models whose free allowance is used up (HTTP 429). */
+  geminiSpent?: string[];
+  /** Gemini refuses the thinking setting (HTTP 400), as an older model might. */
+  geminiNoThinking?: boolean;
 }
 let scenario: Scenario = {};
 /** Simulated database state: app_settings rows and Vault secrets. */
@@ -101,6 +107,24 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     return reply({ embedding: { values: Array.from({ length: 1024 }, (_, i) => (i % 7) / 7) } });
   }
   if (url.endsWith("/rpc/match_chunks")) return reply(scenario.rows ?? ROWS);
+  if (url === "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000") {
+    return scenario.gemini ? reply({ models: scenario.gemini }) : reply({ error: "unavailable" }, 503);
+  }
+  if (url.includes(":generateContent")) {
+    const id = url.match(/models\/([\w.-]+):generateContent/)![1];
+    const req = body as { systemInstruction: { parts: { text: string }[] }; generationConfig: { thinkingConfig?: unknown } };
+    if (scenario.geminiSpent?.includes(id)) {
+      return reply({ error: { code: 429, message: "You exceeded your current quota.", status: "RESOURCE_EXHAUSTED" } }, 429);
+    }
+    if (scenario.geminiNoThinking && req.generationConfig.thinkingConfig) {
+      return reply({ error: { code: 400, message: "Thinking level is not supported for this model.", status: "INVALID_ARGUMENT" } }, 400);
+    }
+    const isChecker = req.systemInstruction.parts[0].text.startsWith("You are a strict verifier");
+    const wait = scenario.delayMs?.(`google-ai-studio/${id}`, isChecker ? "check" : "draft") ?? 0;
+    if (wait) await sleep(wait, init?.signal);
+    const text = isChecker ? CHECKER_OUTPUT : "gemini draft [S1]";
+    return reply({ candidates: [{ content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }] });
+  }
   if (url.includes("/rest/v1/documents")) {
     return reply([{ id: "d1", title: "Contract Case List 2024.md", mime_type: "text/markdown", status: "ready" }]);
   }
@@ -126,7 +150,7 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
   return reply({ error: `unexpected ${url}` }, 500);
 }) as typeof fetch;
 
-const { handler } = await import("./index.ts");
+const { handler, WORKER_STARTED } = await import("./index.ts");
 const { clearModelCatalog } = await import("./pipeline.ts");
 const completions = () => calls.filter((c) => c.url.endsWith("/chat/completions"));
 
@@ -313,7 +337,7 @@ test("models too slow to finish in time: a clear message is sent before the time
   const started = Date.now();
   const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
   const elapsed = Date.now() - started;
-  assert.ok(elapsed >= 1_400 && elapsed < 4_000, `stopped at the time limit (took ${elapsed}ms)`);
+  assert.ok(elapsed >= 1_200 && elapsed < 4_000, `stopped at (or just before) the time limit (took ${elapsed}ms)`);
   const err = evs.find((e) => e.type === "error") as { message: string };
   assert.match(err.message, /didn't finish within 2 seconds.*switch to Paid/s);
   assert.ok(!evs.some((e) => e.type === "final"), "no unchecked answer is shown");
@@ -419,7 +443,8 @@ test("a slow first checker leaves time for the next one", async () => {
   assert.equal(final.checker, "deepseek/deepseek-chat-v3-0324:free");
 });
 
-test("configured free models that are still free keep their place", async () => {
+test("free models chosen by secret keep their place while still free", async () => {
+  ENV.FREE_GENERATORS = "qwen/qwen-2.5-72b-instruct:free, meta-llama/llama-3.3-70b-instruct:free";
   scenario.catalog = [
     { id: "qwen/qwen-2.5-72b-instruct:free", pricing: FREE, context_length: 32768 },
     { id: "deepseek/deepseek-chat-v3.1:free", pricing: FREE, context_length: 163840 },
@@ -447,6 +472,134 @@ test("uses the configured models as-is when OpenRouter's model list is unavailab
   const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
   const meta = evs.find((e) => e.type === "meta") as { generators: string[] };
   assert.equal(meta.generators[0], "meta-llama/llama-3.3-70b-instruct:free");
+});
+
+test("a question asked late in a server worker's life is answered before Supabase stops the worker", async () => {
+  // Supabase stops a worker 150s after it starts, however recently a question arrived.
+  // Here the worker has about 2s left (after the 8s safety margin).
+  ENV.WORKER_LIMIT_MS = String(Date.now() - WORKER_STARTED + 8_000 + 2_300);
+  scenario.delayMs = (_model, role) => (role === "check" ? 60_000 : 0);
+  const started = Date.now();
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  assert.ok(Date.now() - started < 4_000, "replied within the worker's remaining time");
+  const err = evs.find((e) => e.type === "error") as { message: string };
+  assert.match(err.message, /didn't finish within 2 seconds/);
+});
+
+// ---------------------------------------------------------------------------
+// Gemini, called directly
+// ---------------------------------------------------------------------------
+
+const gem = (id: string, displayName: string, methods = ["generateContent", "countTokens"]) => ({
+  name: `models/${id}`,
+  displayName,
+  supportedGenerationMethods: methods,
+});
+const GEMINI_LIST = [
+  gem("gemini-2.5-flash", "Gemini 2.5 Flash"),
+  gem("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite"),
+  gem("gemini-3.5-flash", "Gemini 3.5 Flash"),
+  gem("gemini-3.5-flash-preview-tts", "Gemini 3.5 Flash TTS"),
+  gem("gemini-3.5-flash-image", "Gemini 3.5 Flash Image"),
+  gem("gemini-3.1-pro", "Gemini 3.1 Pro"),
+  gem("gemini-flash-latest", "Gemini Flash Latest"),
+  gem("gemini-embedding-001", "Gemini Embedding", ["embedContent"]),
+];
+const OPENROUTER_FREE = [
+  { id: "nvidia/nemotron-3-ultra-550b-a55b:free", pricing: { prompt: "0", completion: "0" }, context_length: 262144 },
+  { id: "nvidia/nemotron-3-super-120b-a12b:free", pricing: { prompt: "0", completion: "0" }, context_length: 262144 },
+];
+const geminiCalls = () =>
+  calls
+    .filter((c) => c.url.includes(":generateContent"))
+    .map((c) => ({
+      model: c.url.match(/models\/([\w.-]+):/)![1],
+      key: c.headers["x-goog-api-key"],
+      body: c.body as {
+        systemInstruction: { parts: { text: string }[] };
+        contents: { role: string }[];
+        generationConfig: { thinkingConfig?: unknown };
+      },
+    }));
+
+test("free answers draft with Gemini Flash-Lite and are checked by Gemini Flash, using the Gemini key", async () => {
+  scenario.gemini = GEMINI_LIST;
+  scenario.catalog = OPENROUTER_FREE;
+  const evs = await events(await chat({ messages: [{ role: "user", content: "duty of good faith?" }] }));
+  const meta = evs.find((e) => e.type === "meta") as { generators: string[]; checker: string };
+  assert.deepEqual(meta.generators, [
+    "google-ai-studio/gemini-3.5-flash-lite",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+  ]);
+  assert.equal(meta.checker, "google-ai-studio/gemini-3.5-flash");
+  const final = evs.find((e) => e.type === "final") as { checker: string; quotes: { status: string }[] };
+  assert.equal(final.checker, "google-ai-studio/gemini-3.5-flash");
+  assert.equal(final.quotes[0].status, "verified");
+
+  const sent = geminiCalls();
+  assert.deepEqual(sent.map((c) => c.model).sort(), ["gemini-3.5-flash", "gemini-3.5-flash-lite"]);
+  assert.ok(sent.every((c) => c.key === "gem-key"));
+  const check = sent.find((c) => c.model === "gemini-3.5-flash")!;
+  assert.match(check.body.systemInstruction.parts[0].text, /^You are a strict verifier/);
+  assert.equal(check.body.contents.at(-1)!.role, "user");
+  assert.deepEqual(check.body.generationConfig.thinkingConfig, { thinkingLevel: "low" });
+  assert.equal(completions().length, 2, "OpenRouter only drafts");
+});
+
+test("a used-up Gemini allowance moves on to the next model at once", async () => {
+  scenario.gemini = GEMINI_LIST;
+  scenario.catalog = OPENROUTER_FREE;
+  scenario.geminiSpent = ["gemini-3.5-flash"];
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const final = evs.find((e) => e.type === "final") as { checker: string };
+  assert.equal(final.checker, "google-ai-studio/gemini-2.5-flash");
+  // Gemini 2.5 turns thinking off rather than down.
+  const used = geminiCalls().find((c) => c.model === "gemini-2.5-flash")!;
+  assert.deepEqual(used.body.generationConfig.thinkingConfig, { thinkingBudget: 0 });
+});
+
+test("a Gemini model that won't take the thinking setting is asked again without it", async () => {
+  scenario.gemini = GEMINI_LIST;
+  scenario.geminiNoThinking = true;
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const final = evs.find((e) => e.type === "final") as { checker: string };
+  assert.equal(final.checker, "google-ai-studio/gemini-3.5-flash");
+  const tries = geminiCalls().filter((c) => c.model === "gemini-3.5-flash");
+  assert.deepEqual(tries.map((c) => c.body.generationConfig.thinkingConfig), [{ thinkingLevel: "low" }, undefined]);
+});
+
+test("after a quick first draft, slower drafting models get about as long again, not the full wait", async () => {
+  ENV.DRAFT_GRACE_MS = "3000";
+  scenario.gemini = GEMINI_LIST;
+  scenario.catalog = OPENROUTER_FREE;
+  scenario.delayMs = (model, role) => (role === "draft" && !model.startsWith("google-ai-studio/") ? 60_000 : 0);
+  const started = Date.now();
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 900 && elapsed < 2_500, `waited a third of the grace period, not all of it (took ${elapsed}ms)`);
+  const metas = evs.filter((e) => e.type === "meta") as { generators: string[] }[];
+  assert.deepEqual(metas[1].generators, ["google-ai-studio/gemini-3.5-flash-lite"]);
+  assert.ok(evs.some((e) => e.type === "done"));
+});
+
+test("Gemini models are offered first on the Settings page, and can be chosen", async () => {
+  scenario.gemini = GEMINI_LIST;
+  scenario.catalog = OPENROUTER_FREE;
+  const view = await (await get("settings")).json();
+  const free = view.models.options.free as { id: string; name: string }[];
+  assert.deepEqual(free.slice(0, 3).map((o) => o.id), [
+    "google-ai-studio/gemini-3.5-flash",
+    "google-ai-studio/gemini-2.5-flash",
+    "google-ai-studio/gemini-3.5-flash-lite",
+  ]);
+  assert.match(free[0].name, /^Google: Gemini 3\.5 Flash \(direct, with your Gemini key\)$/);
+  assert.equal(view.models.current.free.checker, "google-ai-studio/gemini-3.5-flash");
+
+  const saved = await put("settings", { ai: { freeChecker: "google-ai-studio/gemini-2.5-flash" } });
+  assert.equal(saved.status, 200);
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  assert.equal((evs.find((e) => e.type === "final") as { checker: string }).checker, "google-ai-studio/gemini-2.5-flash");
 });
 
 // ---------------------------------------------------------------------------

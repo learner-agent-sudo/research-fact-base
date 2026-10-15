@@ -45,6 +45,8 @@ function freshEnv(): Record<string, string | undefined> {
     OPENROUTER_API_KEY: "or-test-key",
     GEMINI_API_KEY: "gemini-test-key",
     ALLOWED_EMAILS: `${ALLOWED}, colleague@example.com`,
+    // The test server outlives a Supabase worker (150s); don't shrink answers' time limit.
+    WORKER_LIMIT_MS: String(24 * 60 * 60 * 1000),
   };
 }
 
@@ -63,6 +65,8 @@ export const world = {
   leaked: [] as string[],
   /** OpenRouter's model list; null = unavailable (the function then uses its configured models). */
   catalog: null as null | { id: string; name?: string; context_length?: number; pricing?: { prompt: string; completion: string } }[],
+  /** Google's Gemini model list; null = unavailable (only OpenRouter models are used). */
+  gemini: null as null | { name: string; displayName: string; supportedGenerationMethods: string[] }[],
   /** Simulated database: app_settings rows and Vault secrets. */
   appSettings: {} as Record<string, unknown>,
   vault: {} as Record<string, string>,
@@ -91,6 +95,7 @@ export function resetWorld() {
   world.logouts = 0;
   world.leaked = [];
   world.catalog = null;
+  world.gemini = null;
   world.appSettings = {};
   world.vault = {};
   world.chatDelayMs = 0;
@@ -262,6 +267,19 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     return reply({ embedding: { values: Array.from({ length: 1024 }, (_, i) => (i % 7) / 7) } });
   }
   if (url === `${SUPABASE_URL}/rest/v1/rpc/match_chunks`) return reply(world.rows);
+  if (url === "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000") {
+    return world.gemini ? reply({ models: world.gemini }) : reply({ error: "unavailable" }, 503);
+  }
+  const gemini = url.match(/^https:\/\/generativelanguage\.googleapis\.com\/v1beta\/models\/([\w.-]+):generateContent$/);
+  if (gemini) {
+    const { systemInstruction } = body as { systemInstruction: { parts: { text: string }[] } };
+    world.modelCalls.push(`google-ai-studio/${gemini[1]}`);
+    world.modelKeys.push(headers["x-goog-api-key"] ?? "");
+    const isChecker = systemInstruction.parts[0].text.startsWith("You are a strict verifier");
+    await sleep(world.modelDelayMs[isChecker ? "check" : "draft"], init?.signal);
+    const text = isChecker ? CHECKER_OUTPUT : "draft answer [S1]";
+    return reply({ candidates: [{ content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }] });
+  }
   if (url.startsWith(`${SUPABASE_URL}/rest/v1/documents`)) return reply(DOCS);
   if (url.startsWith(`${SUPABASE_URL}/rest/v1/chunks`)) return reply([{ id: "c1" }], 200, { "content-range": "0-0/1234" });
   if (url === "https://openrouter.ai/api/v1/models") {

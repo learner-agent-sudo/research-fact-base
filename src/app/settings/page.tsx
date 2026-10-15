@@ -183,7 +183,7 @@ function AiCard({ data, onSaved }: { data: SettingsData; onSaved: (d: SettingsDa
         <Field
           label="Drafting models per question (Free mode)"
           htmlFor="fanout"
-          help="More models cross-check each other, but answers are slower and use more of OpenRouter's free daily allowance (each question uses this many requests, plus one for checking)."
+          help="More models cross-check each other, but use more of the free daily allowances (each question uses this many requests, plus one for checking). A slow model never holds an answer up for long."
         >
           <select id="fanout" value={ai.fanout} onChange={(e) => update({ fanout: Number(e.target.value) })} className={SELECT}>
             <option value={1}>1 — fastest, uses the least allowance</option>
@@ -350,7 +350,7 @@ const KEY_INFO: Record<KeyName, { title: string; what: string; where: ReactNode;
   },
   gemini: {
     title: "Google Gemini key",
-    what: "Lets the app search your documents.",
+    what: "Lets the app search your documents, and write and check free answers with Google's fast Gemini models.",
     where: (
       <>
         Get one at{" "}
