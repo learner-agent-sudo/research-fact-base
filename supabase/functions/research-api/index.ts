@@ -27,6 +27,7 @@
 import {
   ConfigError,
   modelOptions,
+  OutOfTime,
   resolveModels,
   runPipeline,
   serviceHeaders,
@@ -105,6 +106,17 @@ function timeLimitMs(): number {
   return Math.max(1_000, Math.min(num("TIME_LIMIT_MS", 120_000), workerLeft));
 }
 
+/**
+ * When Supabase will stop this worker, if its remaining life is what shortens
+ * the time limit: then a question that runs out of time can be asked again on a
+ * fresh worker. Otherwise undefined.
+ */
+function workerEndsAt(): number | undefined {
+  const endsAt = WORKER_STARTED + num("WORKER_LIMIT_MS", 150_000);
+  const workerLeft = endsAt - 8_000 - Date.now();
+  return workerLeft < num("TIME_LIMIT_MS", 120_000) ? endsAt : undefined;
+}
+
 type KeySource = "settings" | "supabase" | "missing";
 
 /** A key saved on the Settings page wins over the Supabase secret. */
@@ -158,6 +170,8 @@ async function load(): Promise<{ cfg: Config; ai: AiSettings; library: LibrarySt
     checkerTimeoutMs: num("CHECKER_TIMEOUT_MS", 80_000),
     timeLimitMs: timeLimitMs(),
     draftGraceMs: num("DRAFT_GRACE_MS", 15_000),
+    checkerHedgeMs: num("CHECKER_HEDGE_MS", 10_000),
+    workerEndsAt: workerEndsAt(),
   };
   return { cfg, ai, library };
 }
@@ -300,7 +314,9 @@ function chatStream(req: Request, messages: ChatMessage[], tier: Tier): Response
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         if (!(err instanceof ConfigError)) console.error("pipeline error:", message);
-        emit({ type: "error", message });
+        // Set only when a fresh worker can answer: the website then asks again itself.
+        const retryAfterMs = err instanceof OutOfTime ? err.retryAfterMs : undefined;
+        emit({ type: "error", message, retryAfterMs });
       } finally {
         clearInterval(ping);
         open = false;

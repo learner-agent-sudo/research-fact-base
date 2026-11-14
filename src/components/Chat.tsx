@@ -171,10 +171,13 @@ function Bubble({ m, onEscalate, busy }: { m: Msg; onEscalate: () => void; busy:
   return (
     <div className="mb-8">
       {m.pending && !m.content ? (
-        <div className="flex items-center gap-2 text-sm text-neutral-500">
-          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-neutral-400" />
-          {stageLabel(m)}
-          {m.startedAt && <Elapsed since={m.startedAt} />}
+        <div>
+          <div className="flex items-center gap-2 text-sm text-neutral-500">
+            <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-neutral-400" />
+            {stageLabel(m)}
+            {m.startedAt && <Elapsed since={m.startedAt} />}
+          </div>
+          {m.note && <div className="mt-1 text-xs text-neutral-500">{m.note}</div>}
         </div>
       ) : (
         m.content && (

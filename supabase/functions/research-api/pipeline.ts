@@ -55,7 +55,7 @@ export type StreamEvent =
     checker: string;
   }
   | { type: "done"; confidence: Confidence; unsupported: string[] }
-  | { type: "error"; message: string }
+  | { type: "error"; message: string; retryAfterMs?: number }
   | { type: "ping" };
 
 export interface ModelSet {
@@ -85,10 +85,19 @@ export interface Config {
    * (less if the first was quick: see runGenerators).
    */
   draftGraceMs: number;
+  /** Once a checker has been running this long without answering, the next one starts alongside it (less if little time is left). */
+  checkerHedgeMs: number;
+  /** When Supabase will stop this worker (ms since epoch), set only when the worker's remaining life is what shortened timeLimitMs. */
+  workerEndsAt?: number;
 }
 
 /** A misconfiguration the operator must fix - shown to the user verbatim. */
 export class ConfigError extends Error {}
+
+/** The answer couldn't be finished in time. `retryAfterMs` is set when a fresh worker would have the time. */
+export class OutOfTime extends Error {
+  retryAfterMs?: number;
+}
 
 export const ABSTAIN =
   "Your documents don't contain anything relevant to this question, so I can't answer it from them.";
@@ -455,9 +464,10 @@ async function geminiComplete(
  *
  * Free answers draft with one Gemini model (Flash-Lite where available: fast,
  * with the largest free allowance) alongside OpenRouter models, and are
- * checked by Gemini Flash, falling back to other Gemini models, then
- * OpenRouter's. A used-up Gemini allowance is refused at once, so falling
- * back costs little time.
+ * checked by Gemini. The newest Flash model checks first; if it is slow or
+ * refused, Flash-Lite (fast, with its own allowance) is next, then the other
+ * Flash model, then OpenRouter's. A used-up Gemini allowance is refused at
+ * once, so falling back costs little time.
  */
 export async function resolveModels(cfg: Config, tier: Tier, signal?: AbortSignal): Promise<ModelSet> {
   const configured = cfg.models[tier];
@@ -473,11 +483,12 @@ export async function resolveModels(cfg: Config, tier: Tier, signal?: AbortSigna
     return {
       // Drafting count is set by cfg.fanout (runPipeline).
       generators: unique([...configured.generators.filter(usable), ...[...lite, ...flash].slice(0, 1), ...openrouter]),
-      // Each Gemini model has its own allowance: two Flash models, then Flash-Lite.
+      // Each Gemini model has its own allowance: the newest Flash, then Flash-Lite, then the other Flash.
       checker: unique([
         ...configured.checker.filter(usable),
-        ...flash.slice(0, 2),
+        ...flash.slice(0, 1),
         ...lite.slice(0, 1),
+        ...flash.slice(1, 2),
         ...openrouter,
       ]).slice(0, 5),
     };
@@ -641,6 +652,18 @@ export function parseCheckerOutput(raw: string, hasSources: boolean): { answer: 
   return { answer, meta };
 }
 
+/** A request that ran out of time (its own timeout, or the deadline) rather than failing. */
+const timedOut = (err: unknown) => {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === "TimeoutError" || name === "AbortError";
+};
+
+/**
+ * Checks the drafts with the checker models, hedged: the next model starts
+ * alongside a slow one (after cfg.checkerHedgeMs, or at once when one fails),
+ * and the first usable answer wins. The others are aborted. Each failure is
+ * recorded in `errors`, naming its model.
+ */
 async function runChecker(
   cfg: Config,
   models: string[],
@@ -649,13 +672,14 @@ async function runChecker(
   sources: Source[],
   drafts: Draft[],
   timeLeft: () => number,
+  errors: string[],
   signal?: AbortSignal,
-): Promise<{ answer: string; meta: CheckerMeta; model: string; errors: string[] }> {
+): Promise<{ answer: string; meta: CheckerMeta; model: string }> {
   const candidates =
     drafts
       .filter((d) => d.content)
       .map((d, i) => `--- Candidate ${i + 1} (${d.model}) ---\n${d.content}`)
-      .join("\n\n") || "(No candidate answers were produced \u2014 write the answer yourself from the sources.)";
+      .join("\n\n") || "(No candidate answers were produced — write the answer yourself from the sources.)";
 
   const messages: Msg[] = [
     { role: "system", content: CHECKER_SYSTEM },
@@ -666,30 +690,76 @@ async function runChecker(
     },
   ];
 
-  // A fallback checker only gets a try if there's a sensible amount of time left,
-  // so all but the last checker may use at most 70% of it. (The last one runs to
-  // the overall deadline, which arrives via `signal`.) Running out of time is
-  // always reported as such.
+  // Aborting `race` stops the checkers still running; `both` also ends with the pipeline signal.
+  const race = new AbortController();
+  const both = anySignal(signal, race.signal);
+  // A checker is only started with a sensible amount of time left (the first always is).
   const minTry = Math.min(10_000, cfg.timeLimitMs / 10);
-  const errors: string[] = [];
-  for (const [i, model] of models.entries()) {
-    if (errors.length && timeLeft() < minTry) throw new Error(tooSlowMessage(cfg));
-    const last = i === models.length - 1;
-    const timeout = last ? cfg.checkerTimeoutMs : Math.min(cfg.checkerTimeoutMs, Math.floor(timeLeft() * 0.7));
-    try {
-      const raw = await chatComplete(cfg, model, messages, timeout, 0.1, signal);
-      return { ...parseCheckerOutput(raw, sources.length > 0), model, errors };
-    } catch (err) {
-      if (signal?.aborted) throw err;
-      errors.push(String(err instanceof Error ? err.message : err));
-    }
-  }
-  const draftErrors = drafts.filter((d) => d.error).map((d) => d.error!);
-  throw new Error(
-    "The AI models didn't respond. Free models are sometimes unavailable or out of their daily allowance \u2014 " +
-      "try again shortly, or switch to Paid for this question.\n\nDetails: " +
-      [...errors, ...draftErrors].join(" | ").slice(0, 600),
-  );
+  const exhausted = () =>
+    new Error(
+      "The AI models didn't respond. Free models are sometimes unavailable or out of their daily allowance — " +
+        "try again shortly, or switch to Paid for this question.\n\nDetails: " +
+        [...errors, ...drafts.filter((d) => d.error).map((d) => d.error!)].join(" | ").slice(0, 600),
+    );
+
+  return await new Promise((resolve, reject) => {
+    let next = 0;
+    let running = 0;
+    let settled = false;
+    let hedge: ReturnType<typeof setTimeout> | undefined;
+
+    // The first outcome wins; later results and errors are ignored.
+    const settle = (done: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hedge);
+      race.abort();
+      done();
+    };
+
+    const startNext = (): void => {
+      clearTimeout(hedge);
+      if (settled) return;
+      if (next >= models.length) {
+        if (!running) settle(() => reject(exhausted()));
+        return;
+      }
+      if (next > 0 && timeLeft() < minTry) {
+        // Too little time for another checker: wait for the ones running, if any.
+        if (!running) settle(() => reject(new OutOfTime(tooSlowMessage(cfg))));
+        return;
+      }
+      const model = models[next++];
+      // A second past the deadline, so running out of time is always reported as
+      // such (it arrives via `signal`), never as this checker failing.
+      const timeout = Math.min(cfg.checkerTimeoutMs, Math.max(1, timeLeft()) + 1_000);
+      const seconds = Math.max(1, Math.round(timeout / 1000));
+      running++;
+      chatComplete(cfg, model, messages, timeout, 0.1, both).then(
+        (raw) => {
+          running--;
+          settle(() => resolve({ ...parseCheckerOutput(raw, sources.length > 0), model }));
+        },
+        (err: unknown) => {
+          running--;
+          // Aborted because another checker won, or the deadline passed: not a failure to report.
+          if (settled) return;
+          const text = err instanceof Error ? err.message : String(err);
+          if (timedOut(err)) errors.push(`${model}: no answer within ${seconds}s`);
+          else errors.push(text.startsWith(`${model}:`) ? text : `${model}: ${text}`);
+          startNext();
+        },
+      );
+      if (next < models.length) {
+        hedge = setTimeout(startNext, Math.min(cfg.checkerHedgeMs, Math.max(250, Math.floor(timeLeft() / 4))));
+      }
+    };
+
+    const onAbort = () => settle(() => reject(signal?.reason));
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+    startNext();
+  });
 }
 
 /** Shown when the models are too slow to answer within the time limit. */
@@ -772,6 +842,11 @@ export async function runPipeline(
   const budget = withTimeout(signal, cfg.timeLimitMs);
   const timings: Record<string, number> = {};
   const lap = (step: string) => (timings[step] = Date.now() - started);
+  // Declared outside the try, so a failure logs whatever was learned before it.
+  const errors: string[] = [];
+  let drafts: Draft[] = [];
+  // Model and draft errors for the logs: model names and statuses, never the question.
+  const failures = () => [...drafts.map((d) => d.error ?? ""), ...errors].filter(Boolean).map((e) => e.slice(0, 240));
 
   try {
     emit({ type: "stage", stage: "retrieving" });
@@ -793,13 +868,13 @@ export async function runPipeline(
     emit({ type: "stage", stage: "drafting" });
     // Drafting may use just over half the remaining time; the rest is kept for checking.
     const draftMs = Math.min(cfg.generatorTimeoutMs, Math.floor(timeLeft() * 0.55));
-    const drafts = await runGenerators(cfg, generators, question, history, sources, draftMs, budget);
+    drafts = await runGenerators(cfg, generators, question, history, sources, draftMs, budget);
     lap("drafted");
     // Credit only the models whose drafts were actually used.
     emit({ type: "meta", tier, generators: drafts.filter((d) => d.content).map((d) => d.model), checker: set.checker[0] ?? "" });
 
     emit({ type: "stage", stage: "checking" });
-    const checked = await runChecker(cfg, set.checker, question, history, sources, drafts, timeLeft, budget);
+    const checked = await runChecker(cfg, set.checker, question, history, sources, drafts, timeLeft, errors, budget);
     lap("checked");
     // Timings, model names and model errors only (never the question), for diagnosing slow answers.
     console.log(JSON.stringify({
@@ -809,7 +884,7 @@ export async function runPipeline(
       ms: timings,
       drafts: Object.fromEntries(drafts.map((d) => [d.model, !!d.content])),
       checker: checked.model,
-      errors: [...drafts.map((d) => d.error ?? ""), ...checked.errors].filter(Boolean).map((e) => e.slice(0, 240)),
+      errors: failures(),
     }));
 
     emit({ type: "stage", stage: "verifying" });
@@ -827,13 +902,19 @@ export async function runPipeline(
     emit({ type: "done", confidence, unsupported });
   } catch (err) {
     lap("failed");
+    const outOfTime = (budget.aborted && !signal?.aborted) || err instanceof OutOfTime;
     console.log(JSON.stringify({
       event: "answer_failed",
       tier,
       limit: cfg.timeLimitMs,
       ms: timings,
-      outOfTime: budget.aborted && !signal?.aborted,
+      outOfTime,
+      errors: failures(),
     }));
-    throw budget.aborted && !signal?.aborted ? new Error(tooSlowMessage(cfg)) : err;
+    if (!outOfTime) throw err;
+    const late = new OutOfTime(tooSlowMessage(cfg));
+    // If Supabase is about to stop this worker, a fresh one can answer: say when to ask again.
+    if (cfg.workerEndsAt !== undefined) late.retryAfterMs = Math.max(0, cfg.workerEndsAt - Date.now()) + 2_000;
+    throw late;
   }
 }

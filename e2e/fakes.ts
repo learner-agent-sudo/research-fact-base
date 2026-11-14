@@ -76,6 +76,11 @@ export const world = {
   chatHang: false,
   /** The answer's stream ends early, before the final answer. */
   chatTruncate: false,
+  /**
+   * The next question arrives on a server worker that is about to stop (about
+   * 1.5s left) and the checking models hang: only that one request.
+   */
+  oldWorkerOnce: false,
   /** How long each AI model takes to reply, in ms. */
   modelDelayMs: { draft: 0, check: 0 },
 };
@@ -101,6 +106,7 @@ export function resetWorld() {
   world.chatDelayMs = 0;
   world.chatHang = false;
   world.chatTruncate = false;
+  world.oldWorkerOnce = false;
   world.modelDelayMs = { draft: 0, check: 0 };
   // The function caches OpenRouter's model list; start each test without it.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -298,12 +304,16 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
 }) as typeof fetch;
 
 type Handler = (req: Request) => Promise<Response>;
-let handler: Handler | null = null;
-function edgeFunction(): Handler {
+type EdgeModule = { handler: Handler; WORKER_STARTED: number };
+let edge: EdgeModule | null = null;
+function edgeModule(): EdgeModule {
   // Loaded lazily so the Deno/fetch stand-ins above are in place first.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  handler ??= (require("../supabase/functions/research-api/index.ts") as { handler: Handler }).handler;
-  return handler;
+  edge ??= require("../supabase/functions/research-api/index.ts") as EdgeModule;
+  return edge;
+}
+function edgeFunction(): Handler {
+  return edgeModule().handler;
 }
 
 async function realApi(route: Route) {
@@ -322,20 +332,44 @@ async function realApi(route: Route) {
   }
   if (apiRoute === "chat" && world.chatDelayMs) await new Promise((r) => setTimeout(r, world.chatDelayMs));
   const forwarded = Object.fromEntries(Object.entries(headers).filter(([k]) => !k.startsWith(":") && k !== "host"));
-  const res = await edgeFunction()(
-    new Request(req.url(), {
-      method,
-      headers: forwarded,
-      body: method === "GET" || method === "OPTIONS" || !raw ? undefined : new Uint8Array(raw),
-    }),
-  );
-  let body = Buffer.from(await res.arrayBuffer());
+
+  // An old worker, for this one question: Supabase stops it about 1.5s from now, and the checkers hang.
+  let restore = () => {};
+  if (apiRoute === "chat" && world.oldWorkerOnce) {
+    world.oldWorkerOnce = false;
+    const { WORKER_STARTED } = edgeModule();
+    const { WORKER_LIMIT_MS: limit } = world.env;
+    const check = world.modelDelayMs.check;
+    world.env.WORKER_LIMIT_MS = String(Date.now() - WORKER_STARTED + 8_000 + 1_500);
+    world.modelDelayMs.check = 60_000;
+    restore = () => {
+      world.env.WORKER_LIMIT_MS = limit;
+      world.modelDelayMs.check = check;
+    };
+  }
+  let body: Buffer;
+  let status: number;
+  let resHeaders: Headers;
+  try {
+    const res = await edgeFunction()(
+      new Request(req.url(), {
+        method,
+        headers: forwarded,
+        body: method === "GET" || method === "OPTIONS" || !raw ? undefined : new Uint8Array(raw),
+      }),
+    );
+    status = res.status;
+    resHeaders = res.headers;
+    body = Buffer.from(await res.arrayBuffer());
+  } finally {
+    restore();
+  }
   if (apiRoute === "chat" && world.chatTruncate) {
     const lines = body.toString().split("\n");
     body = Buffer.from(lines.slice(0, lines.findIndex((l) => l.includes('"type":"final"'))).join("\n") + "\n");
   }
   // The page may have stopped waiting (Stop, reload) while the answer was prepared.
-  await route.fulfill({ status: res.status, headers: Object.fromEntries(res.headers.entries()), body }).catch(() => {});
+  await route.fulfill({ status, headers: Object.fromEntries(resHeaders.entries()), body }).catch(() => {});
 }
 
 /** Routes the page's network: the site itself is served locally; nothing else leaves the machine. */

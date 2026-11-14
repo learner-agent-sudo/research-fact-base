@@ -341,6 +341,8 @@ test("models too slow to finish in time: a clear message is sent before the time
   const err = evs.find((e) => e.type === "error") as { message: string };
   assert.match(err.message, /didn't finish within 2 seconds.*switch to Paid/s);
   assert.ok(!evs.some((e) => e.type === "final"), "no unchecked answer is shown");
+  // A fresh worker: asking again would not help, so no retry is offered.
+  assert.equal(err.retryAfterMs, undefined);
 });
 
 test("slow drafting can't use up the time needed for checking", async () => {
@@ -486,6 +488,59 @@ test("a question asked late in a server worker's life is answered before Supabas
   assert.match(err.message, /didn't finish within 2 seconds/);
 });
 
+test("running out of time on an old worker tells the website when a fresh one is ready", async () => {
+  // As the test above: the worker has about 2.3s left, so the answer runs out of time.
+  ENV.WORKER_LIMIT_MS = String(Date.now() - WORKER_STARTED + 8_000 + 2_300);
+  scenario.delayMs = (_model, role) => (role === "check" ? 60_000 : 0);
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const err = evs.find((e) => e.type === "error") as { message: string; retryAfterMs?: number };
+  assert.match(err.message, /didn't finish within 2 seconds/);
+  // The worker stops about 10s from now; the website waits that long, plus a margin.
+  assert.equal(typeof err.retryAfterMs, "number");
+  assert.ok(err.retryAfterMs! >= 8_000 && err.retryAfterMs! <= 12_000, `retry after ${err.retryAfterMs}ms`);
+});
+
+test("a checker that never answers doesn't hold up the answer", async () => {
+  ENV.CHECKER_HEDGE_MS = "300";
+  scenario.gemini = GEMINI_LIST;
+  scenario.catalog = OPENROUTER_FREE;
+  scenario.delayMs = (model, role) =>
+    role === "check" && (model === "google-ai-studio/gemini-3.5-flash" || model === "google-ai-studio/gemini-2.5-flash")
+      ? 60_000
+      : 0;
+  const started = Date.now();
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 2_500, `answered without waiting for the silent checkers (took ${elapsed}ms)`);
+  const final = evs.find((e) => e.type === "final") as { checker: string };
+  assert.equal(final.checker, "google-ai-studio/gemini-3.5-flash-lite");
+});
+
+test("the failure log says why the models weren't used", async () => {
+  ENV.TIME_LIMIT_MS = "1500";
+  scenario.gemini = GEMINI_LIST;
+  scenario.catalog = OPENROUTER_FREE;
+  scenario.geminiSpent = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite"];
+  scenario.delayMs = (model, role) => (role === "check" && !model.startsWith("google-ai-studio/") ? 60_000 : 0);
+  const logged: string[] = [];
+  const log = console.log;
+  console.log = (line: string) => logged.push(line);
+  let evs: Record<string, unknown>[];
+  try {
+    evs = await events(await chat({ messages: [{ role: "user", content: "duty of good faith?" }] }));
+  } finally {
+    console.log = log;
+  }
+  const err = evs.find((e) => e.type === "error") as { message: string };
+  assert.match(err.message, /didn't finish within/);
+  const entry = JSON.parse(logged.find((l) => l.includes('"event":"answer_failed"'))!);
+  assert.ok(
+    entry.errors.some((e: string) => /gemini-3\.5-flash: HTTP 429/.test(e)),
+    `errors name the model and status: ${JSON.stringify(entry.errors)}`,
+  );
+  assert.ok(!logged.join("").includes("duty of good faith"), "the question is not logged");
+});
+
 // ---------------------------------------------------------------------------
 // Gemini, called directly
 // ---------------------------------------------------------------------------
@@ -553,15 +608,24 @@ test("a used-up Gemini allowance moves on to the next model at once", async () =
   scenario.geminiSpent = ["gemini-3.5-flash"];
   const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
   const final = evs.find((e) => e.type === "final") as { checker: string };
-  assert.equal(final.checker, "google-ai-studio/gemini-2.5-flash");
+  assert.equal(final.checker, "google-ai-studio/gemini-3.5-flash-lite");
   const meta = evs.find((e) => e.type === "meta") as { checker: string };
   assert.equal(meta.checker, "google-ai-studio/gemini-3.5-flash");
+});
+
+test("when Flash and Flash-Lite are used up, the older Flash model checks, with thinking off", async () => {
+  scenario.gemini = GEMINI_LIST;
+  scenario.catalog = OPENROUTER_FREE;
+  scenario.geminiSpent = ["gemini-3.5-flash", "gemini-3.5-flash-lite"];
+  const evs = await events(await chat({ messages: [{ role: "user", content: "q" }] }));
+  const final = evs.find((e) => e.type === "final") as { checker: string };
+  assert.equal(final.checker, "google-ai-studio/gemini-2.5-flash");
   // Gemini 2.5 turns thinking off rather than down.
   const used = geminiCalls().find((c) => c.model === "gemini-2.5-flash")!;
   assert.deepEqual(used.body.generationConfig.thinkingConfig, { thinkingBudget: 0 });
 });
 
-test("when the Flash models' allowances are used up, Flash-Lite checks before slower OpenRouter models", async () => {
+test("when the newest Flash model's allowance is used up, Flash-Lite checks next", async () => {
   scenario.gemini = [...GEMINI_LIST, gem("gemini-3.4-flash", "Gemini 3.4 Flash")];
   scenario.catalog = OPENROUTER_FREE;
   scenario.geminiSpent = ["gemini-3.5-flash", "gemini-3.4-flash"];
@@ -576,7 +640,7 @@ test("when the Flash models' allowances are used up, Flash-Lite checks before sl
   }
   // The log says why each model wasn't used, without the question.
   const entry = JSON.parse(logged.find((l) => l.includes('"event":"answer"'))!);
-  assert.equal(entry.errors.length, 2);
+  assert.equal(entry.errors.length, 1);
   assert.match(entry.errors[0], /gemini-3\.5-flash: HTTP 429 .*quota/);
   assert.ok(!logged.join("").includes('"q"'));
 });

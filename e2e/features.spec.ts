@@ -129,6 +129,19 @@ test.describe("conversation", () => {
     await expect(page.getByRole("button", { name: "Send" })).toBeVisible();
   });
 
+  test("a question that runs out of time on an old server worker is asked again automatically", async ({ page }) => {
+    world.oldWorkerOnce = true;
+    await signIn(page);
+    await ask(page);
+    await expect(
+      page.getByText("This research server was near its time limit, so the question is being asked again on a fresh one…"),
+    ).toBeVisible();
+    await expect(page.locator(".answer")).toContainText(ANSWER, { timeout: 30_000 });
+    // The error box (not the red citation badges the fixture always shows).
+    await expect(page.locator("div.whitespace-pre-wrap.border-red-200")).toHaveCount(0);
+    expect(world.apiRequests.filter((r) => r.route === "chat")).toHaveLength(2);
+  });
+
   test("New conversation starts afresh, and follow-ups don't carry the old one", async ({ page }) => {
     await signIn(page);
     await ask(page);

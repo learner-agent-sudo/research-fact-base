@@ -50,6 +50,8 @@ export interface Msg {
   pending?: boolean;
   /** When the answer was requested (ms since epoch), to show how long it's taking. */
   startedAt?: number;
+  /** Shown while the answer is pending, e.g. while it's being asked again. */
+  note?: string;
   error?: string;
 }
 
@@ -71,6 +73,8 @@ export const STALLED =
   "The research service stopped responding, so this answer was abandoned. Please ask again, or switch to Paid.";
 export const TOO_LONG = "This answer took more than 3 minutes, so it was stopped. Please ask again, or switch to Paid.";
 export const INCOMPLETE = "The answer stopped before it finished. Please ask again.";
+export const RETRYING =
+  "This research server was near its time limit, so the question is being asked again on a fresh one…";
 
 // The server sends a keep-alive every 10 seconds while it works, and always
 // finishes within about 2 minutes, so these only trip if something is wrong.
@@ -145,7 +149,7 @@ export function attachUser(userId: string) {
   } catch {
     // unreadable: start fresh
   }
-  messages = messages.map((m) => (m.pending ? { ...m, pending: false, error: m.error ?? INTERRUPTED } : m));
+  messages = messages.map((m) => (m.pending ? { ...m, pending: false, note: undefined, error: m.error ?? INTERRUPTED } : m));
   epoch++;
   set({ userId, messages, busy: false, tierChosen: false });
 }
@@ -232,14 +236,40 @@ async function run(turns: { role: string; content: string }[], tier: Tier) {
   };
   cancel = giveUp;
   const { stallMs, maxMs } = limits();
-  let stall = setTimeout(() => giveUp(STALLED), stallMs);
-  const overall = setTimeout(() => giveUp(TOO_LONG), maxMs);
+  let stall: ReturnType<typeof setTimeout> | undefined;
+  let overall: ReturnType<typeof setTimeout> | undefined;
   const alive = () => {
     clearTimeout(stall);
     stall = setTimeout(() => giveUp(STALLED), stallMs);
   };
+  const startTimers = () => {
+    clearTimeout(overall);
+    alive();
+    overall = setTimeout(() => giveUp(TOO_LONG), maxMs);
+  };
+  const stopTimers = () => {
+    clearTimeout(stall);
+    clearTimeout(overall);
+  };
 
-  try {
+  // Waits `ms`, but rejects at once if the answer is given up on (Stop, reload, timeouts).
+  const pause = (ms: number) =>
+    new Promise<void>((resolve, reject) => {
+      if (controller.signal.aborted) return reject(controller.signal.reason);
+      const onAbort = () => {
+        clearTimeout(t);
+        reject(controller.signal.reason);
+      };
+      const t = setTimeout(() => {
+        controller.signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+
+  // One request and its answer. On the first attempt, returns how long to wait before
+  // asking again when the server ran out of time on an old worker (null otherwise).
+  const once = async (first: boolean): Promise<number | null> => {
     const res = await api("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -252,6 +282,7 @@ async function run(turns: { role: string; content: string }[], tier: Tier) {
     const decoder = new TextDecoder();
     let buf = "";
     let finished = false;
+    let retryAfterMs: number | null = null;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -288,21 +319,44 @@ async function run(turns: { role: string; content: string }[], tier: Tier) {
             break;
           case "done":
             finished = true;
-            patch({ confidence: ev.confidence as Confidence, unsupported: ev.unsupported as string[], pending: false });
+            patch({
+              confidence: ev.confidence as Confidence,
+              unsupported: ev.unsupported as string[],
+              pending: false,
+              note: undefined,
+            });
             break;
           case "error":
             finished = true;
-            patch({ error: ev.message as string, pending: false });
+            if (first && typeof ev.retryAfterMs === "number") {
+              retryAfterMs = ev.retryAfterMs;
+              break; // not shown: the question is asked again
+            }
+            patch({ error: ev.message as string, pending: false, note: undefined });
             break;
         }
       }
     }
-    patch(finished ? { pending: false } : { error: INCOMPLETE, pending: false });
+    if (retryAfterMs !== null) return retryAfterMs;
+    patch(finished ? { pending: false, note: undefined } : { error: INCOMPLETE, pending: false, note: undefined });
+    return null;
+  };
+
+  startTimers();
+  try {
+    const retryAfter = await once(true);
+    if (retryAfter !== null) {
+      // The old worker is about to stop, so a fresh one is asked: at most one retry.
+      patch({ note: RETRYING, stage: undefined, sources: undefined, generators: undefined, checker: undefined });
+      stopTimers();
+      await pause(Math.min(retryAfter, 20_000));
+      startTimers();
+      await once(false);
+    }
   } catch (e) {
-    if (epoch === myEpoch) patch({ error: reason ?? describeFailure(e), pending: false });
+    if (epoch === myEpoch) patch({ error: reason ?? describeFailure(e), pending: false, note: undefined });
   } finally {
-    clearTimeout(stall);
-    clearTimeout(overall);
+    stopTimers();
     if (cancel === giveUp) cancel = null;
     if (epoch === myEpoch) set({ busy: false });
   }
